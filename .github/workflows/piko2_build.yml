@@ -29,6 +29,24 @@ jobs:
       - name: Cache Gradle
         uses: burrunan/gradle-cache-action@v3
 
+      # Same cleanup as crimera/piko-newx's build_piko.py (pre_build_cleanup): the bundle must hold
+      # only NewX patches. The classic-X patches target 12.19.1 and fail on NewX builds because
+      # their settings patch expects res/xml/settings_root.xml.
+      - name: Keep only NewX patches
+        run: |
+          set -euo pipefail
+          rm -rf patches/src/main/kotlin/app/crimera/patches/instagram \
+                 patches/src/main/kotlin/app/crimera/patches/twitter \
+                 patches/src/main/kotlin/app/revanced \
+                 extensions/instagram \
+                 extensions/twitter
+          # Keep the twitter/bringbacktwitter assets the "Bring back twitter" patch uses.
+          if [ -d patches/src/main/resources/twitter ]; then
+            find patches/src/main/resources/twitter -mindepth 1 -maxdepth 1 ! -name bringbacktwitter -exec rm -rf {} +
+          fi
+          find patches/src/main/resources/addresources -mindepth 2 -maxdepth 2 -type d \
+            \( -name instagram -o -name twitter \) -exec rm -rf {} +
+
       - name: Build with Gradle
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
