@@ -157,6 +157,8 @@
     <string name="piko_newx_dynamic_color_like_summary">Uses the dynamic accent for liked posts. Warning: This disables the heart Lottie animation.</string>
     <string name="piko_newx_disable_blur_title">Disable Compose blur</string>
     <string name="piko_newx_disable_blur_summary">Removes blur from NewX Compose UI while keeping configured background tint and scrim effects</string>
+    <string name="piko_newx_piko_2_magazine_title">Piko 2.0</string>
+    <string name="piko_newx_piko_2_magazine_summary">Shows the home timeline as a magazine-style grid of post cards. Tap a card to open the post.</string>
 
     <string name="piko_newx_browse_tweet_object_title">Browse tweet object</string>
     <string name="piko_newx_browse_tweet_object_summary">Adds a debug option to inspect the tweet object in post menus</string>

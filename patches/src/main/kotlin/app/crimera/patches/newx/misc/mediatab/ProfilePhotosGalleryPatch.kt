@@ -19,6 +19,7 @@ import app.crimera.bytecode.Target
 import app.crimera.bytecode.fieldReference
 import app.crimera.bytecode.insertHook
 import app.crimera.bytecode.methodReference
+import app.crimera.patches.common.requireAtMostOne
 import app.crimera.patches.common.requireExactlyOne
 import app.morphe.patcher.extensions.InstructionExtensions.removeInstruction
 import app.morphe.patcher.patch.BytecodePatchContext
@@ -83,10 +84,23 @@ private const val COMPOSE_LAZY_SCOPE = "Landroidx/compose/foundation/lazy/"
 // alpha.04 while the real pair moved to sj/rj). Both are derived from the
 // navigate (destination, Z) call below.
 private const val GALLERY_EXTENSION = "Lapp/morphe/extension/newx/misc/ProfilePhotosGallery;"
+private const val MAGAZINE_EXTENSION = "Lapp/morphe/extension/newx/misc/MagazineFeed;"
+private const val MAGAZINE_HOME_TIMELINE_LABEL = "piko_magazine_home_timeline"
+// Home tabs, the same enum contract DisableTimelineRefreshPatch requires.
+private val MAGAZINE_HOME_TIMELINE_NAMES = listOf("FOR_YOU", "FOLLOWING", "RANKED_FOLLOWING")
+
+/**
+ * Home-timeline enum fields the shared timeline-body preamble diverts to the Piko 2.0 magazine
+ * grid. Written by the gallery patch's execute, which runs first as a dependency of
+ * [newXMagazineFeedPatch]; that patch fails closed when this stays empty.
+ */
+internal var magazineHomeTimelineFields: List<String> = emptyList()
+    private set
 
 private data class ResolvedTimelineType(
     val descriptor: String,
     val photosField: String,
+    val homeFields: List<String>,
 )
 
 private data class ResolvedComposeContracts(
@@ -224,7 +238,24 @@ private fun resolveTimelineType(classDefs: List<ClassDef>): ResolvedTimelineType
     }
     val (classType, photosField) =
         requireExactlyOne("NewX USER_PROFILE_PHOTOS enum", candidates)
-    return ResolvedTimelineType(classType, photosField)
+    // The magazine branch needs every home constant on this same enum. A partial set is not
+    // emitted at all: the gallery keeps working and the magazine patch fails closed instead.
+    val enumClass = classDefs.single { it.type == classType }
+    val homeFields = MAGAZINE_HOME_TIMELINE_NAMES.map { name ->
+        requireAtMostOne(
+            "NewX home timeline enum constant $name",
+            enumClass.fields.filter { field ->
+                field.name == name &&
+                    AccessFlags.STATIC.isSet(field.accessFlags) &&
+                    field.type == classType
+            },
+        )?.toString()
+    }
+    return ResolvedTimelineType(
+        descriptor = classType,
+        photosField = photosField,
+        homeFields = if (homeFields.all { it != null }) homeFields.filterNotNull() else emptyList(),
+    )
 }
 
 context(context: BytecodePatchContext)
@@ -1625,6 +1656,59 @@ private fun Block.galleryInstructions(
     composerRegister: Int,
     factoryRegister: Int,
 ) {
+    fun androidViewBody(extension: String) {
+        androidViewInstructions(
+            compose = compose,
+            extension = extension,
+            listRegister = listRegister,
+            callbackRegister = callbackRegister,
+            itemClickCallbackRegister = itemClickCallbackRegister,
+            paddingValuesRegister = paddingValuesRegister,
+            modifierRegister = modifierRegister,
+            composerRegister = composerRegister,
+            factoryRegister = factoryRegister,
+        )
+    }
+
+    move(1, timelineTypeRegister, OBJECT)
+    // Piko 2.0: home timelines divert to the magazine grid. Emitted only when every home
+    // constant resolved; the Photos comparison below is unchanged either way.
+    timeline.homeFields.forEach { homeField ->
+        sget(0, fieldReference(homeField))
+        ifEq(1, 0, Target.Local(MAGAZINE_HOME_TIMELINE_LABEL))
+    }
+    sget(0, fieldReference(timeline.photosField))
+    ifNe(1, 0, Target.Original)
+    invokeStatic(methodReference("$GALLERY_EXTENSION->isEnabled()Z"))
+    moveResult(0, "Z")
+    ifEqz(0, Target.Original)
+    androidViewBody(GALLERY_EXTENSION)
+
+    if (timeline.homeFields.isNotEmpty()) {
+        label(MAGAZINE_HOME_TIMELINE_LABEL)
+        invokeStatic(methodReference("$MAGAZINE_EXTENSION->isEnabled()Z"))
+        moveResult(0, "Z")
+        ifEqz(0, Target.Original)
+        androidViewBody(MAGAZINE_EXTENSION)
+    }
+}
+
+/**
+ * Hands [extension]'s factory and updater to the androidView composable and returns: the body the
+ * gallery and the magazine grid share. Both extensions expose the same
+ * `createFactory`/`createUpdater(List, Object, Object, F, F)` contract.
+ */
+private fun Block.androidViewInstructions(
+    compose: ResolvedComposeContracts,
+    extension: String,
+    listRegister: Int,
+    callbackRegister: Int,
+    itemClickCallbackRegister: Int,
+    paddingValuesRegister: Int,
+    modifierRegister: Int,
+    composerRegister: Int,
+    factoryRegister: Int,
+) {
     val androidViewParameters = compose.androidView.parameterTypes
     val androidViewLastRegister = androidViewParameters.lastIndex
     // The flag slots the androidView composable reads after the composer; they stay at zero so the
@@ -1632,17 +1716,10 @@ private fun Block.galleryInstructions(
     val androidViewFlagSlots = androidViewParameters.drop(4).indices
     val androidViewRegisters = IntArray(androidViewLastRegister + 1) { index -> index }
 
-    sget(0, fieldReference(timeline.photosField))
-    move(1, timelineTypeRegister, OBJECT)
-    ifNe(1, 0, Target.Original)
-    invokeStatic(methodReference("$GALLERY_EXTENSION->isEnabled()Z"))
-    moveResult(0, "Z")
-    ifEqz(0, Target.Original)
-
     emitGalleryFactory(
         compose = compose,
         factoryDescriptor =
-            "$GALLERY_EXTENSION->createFactory(Ljava/util/List;Ljava/lang/Object;Ljava/lang/Object;FF)$FUNCTION1",
+            "$extension->createFactory(Ljava/util/List;Ljava/lang/Object;Ljava/lang/Object;FF)$FUNCTION1",
         listRegister = listRegister,
         callbackRegister = callbackRegister,
         itemClickCallbackRegister = itemClickCallbackRegister,
@@ -1653,7 +1730,7 @@ private fun Block.galleryInstructions(
     emitGalleryFactory(
         compose = compose,
         factoryDescriptor =
-            "$GALLERY_EXTENSION->createUpdater(Ljava/util/List;Ljava/lang/Object;Ljava/lang/Object;FF)$FUNCTION1",
+            "$extension->createUpdater(Ljava/util/List;Ljava/lang/Object;Ljava/lang/Object;FF)$FUNCTION1",
         listRegister = listRegister,
         callbackRegister = callbackRegister,
         itemClickCallbackRegister = itemClickCallbackRegister,
@@ -1709,6 +1786,7 @@ val newXProfilePhotosGalleryPatch =
             // phase takes its own fresh snapshot after these mutations.
             val classDefs = allClassDefs()
             val timelineType = resolveTimelineType(classDefs)
+            magazineHomeTimelineFields = timelineType.homeFields
             val timelineListDescriptor = resolveTimelineListDescriptor(classDefs)
             val compose = resolveComposeContracts(classDefs)
             val pagingEvent = resolvePagingEvent(classDefs)
