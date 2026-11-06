@@ -1,0 +1,42 @@
+name: Build Piko 2.0 patches
+
+# Builds the patch bundle from this branch and keeps the .mpp as a downloadable artifact.
+# Runs on GitHub's servers with the job's own token, so no personal token is needed.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - piko-2.0-magazine
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    name: Build patches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: burrunan/gradle-cache-action@v3
+
+      - name: Build with Gradle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew clean buildAndroid --no-daemon
+
+      - name: Upload patch bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: piko-2.0-patches
+          path: patches/build/libs/*.mpp
+          if-no-files-found: error
