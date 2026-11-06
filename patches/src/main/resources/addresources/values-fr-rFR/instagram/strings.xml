@@ -444,6 +444,7 @@
     <string name="piko_view_saved_instants">Voir les Instants enregistrés</string>
     <string name="piko_instants_vault_empty">Aucun Instant enregistré pour le moment. Ouvrez des Instants avec la capture activée et ils apparaîtront ici.</string>
     <string name="piko_instants_link_unavailable">Lien vers le média indisponible.</string>
+    <string name="piko_instants_delete_selected_confirm">Supprimer %d Instants sélectionnés ?</string>
     <string name="piko_delete">Supprimer</string>
     <string name="piko_instants_title">Instants</string>
     <string name="piko_search_username">Rechercher par nom d\'utilisateur</string>

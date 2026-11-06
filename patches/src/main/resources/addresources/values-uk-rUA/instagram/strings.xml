@@ -345,6 +345,8 @@
     <string name="piko_action_bar_chat">Піктограми панелі дій чату</string>
     <string name="piko_action_bar_chat_desc">Піктограми на панелі дій усередині особистих повідомлень (DM)</string>
     <string name="piko_action_bar_inbox">Піктограми панелі дій вхідних повідомлень</string>
+    <string name="piko_action_bar_button_audio_call_icon">Значок аудіодзвінка</string>
+    <string name="piko_action_bar_button_video_call_icon">Значок відеодзвінка</string>
     <string name="piko_action_bar_button_settings_icon">Піктограма налаштувань</string>
     <string name="piko_action_bar_button_ghost_mode_icon">Піктограма режиму «невидимки»</string>
     <string name="piko_action_bar_button_jump_oldest_icon">Значок переходу до найстарішого повідомлення</string>
@@ -444,6 +446,7 @@
     <string name="piko_view_saved_instants">Переглянути збережені Instants</string>
     <string name="piko_instants_vault_empty">Поки що немає збережених Instants. Відкрийте кілька Instants з увімкненим збереженням, і вони з\'являться тут.</string>
     <string name="piko_instants_link_unavailable">Посилання на медіа недоступне.</string>
+    <string name="piko_instants_delete_selected_confirm">Видалити вибрані Instants (%d)?</string>
     <string name="piko_delete">Видалити</string>
     <string name="piko_instants_title">Instants</string>
     <string name="piko_search_username">Пошук за ім\'ям користувача</string>

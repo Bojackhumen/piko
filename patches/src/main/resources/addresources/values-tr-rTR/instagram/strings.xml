@@ -444,6 +444,7 @@
     <string name="piko_view_saved_instants">Kaydedilmiş Şipşaklar</string>
     <string name="piko_instants_vault_empty">Henüz kaydedilmiş Şipşak yok. Yakalama özelliği etkinleştirilmiş bazı Şipşakları açın; burada görünmeye başlayacaklar.</string>
     <string name="piko_instants_link_unavailable">Medya bağlantısı mevcut değil.</string>
+    <string name="piko_instants_delete_selected_confirm">Seçilen %d Şipşak silinsin mi?</string>
     <string name="piko_delete">Sil</string>
     <string name="piko_instants_title">Şipşaklar</string>
     <string name="piko_search_username">Kullanıcı adına göre ara</string>

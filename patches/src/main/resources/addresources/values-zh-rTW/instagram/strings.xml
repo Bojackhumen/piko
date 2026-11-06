@@ -345,6 +345,8 @@
     <string name="piko_action_bar_chat">訊息操作列圖示</string>
     <string name="piko_action_bar_chat_desc">私訊中的操作列圖示</string>
     <string name="piko_action_bar_inbox">收件匣操作列圖示</string>
+    <string name="piko_action_bar_button_audio_call_icon">一般通話圖示</string>
+    <string name="piko_action_bar_button_video_call_icon">視訊通話圖示</string>
     <string name="piko_action_bar_button_settings_icon">設定圖示</string>
     <string name="piko_action_bar_button_ghost_mode_icon">幽靈模式圖示</string>
     <string name="piko_action_bar_button_jump_oldest_icon">跳至最舊訊息圖示</string>
