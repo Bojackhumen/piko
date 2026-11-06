@@ -1,6 +1,8 @@
 package app.morphe.extension.newx.misc;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Outline;
@@ -184,19 +186,27 @@ public final class MagazineFeed {
             currentItemCount = next.size();
         }
 
-        private void openPost(PostCard card) {
-            if (!(itemClickCallback instanceof Function1)) {
-                log("card tap without a click callback");
+        /**
+         * Opens the post, or one of its photos/videos, through X's own deep-link handling.
+         *
+         * <p>The timeline's item-click callback does nothing for home-timeline posts (tested on
+         * 12.40.1: taps were swallowed), so cards use the same in-app deep link the Photos gallery
+         * falls back to. The intent is pinned to this package, so X opens it in-app.
+         */
+        private void openPost(PostCard card, String mediaPath) {
+            String target = card.link(mediaPath);
+            if (target == null) {
+                log("tap without a post id or author: " + card.postId);
                 return;
             }
+            Context context = getContext();
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(target));
+            intent.setPackage(context.getPackageName());
+            if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             try {
-                @SuppressWarnings("unchecked")
-                Function1<Object, Object> click = (Function1<Object, Object>) itemClickCallback;
-                // No pending gallery photo is registered, so the shared click handler takes its
-                // native path and opens the post detail.
-                click.invoke(card.timelineItem);
-            } catch (Throwable t) {
-                NewXLogger.printException(() -> LOG_PREFIX + "card tap failed", t);
+                context.startActivity(intent);
+            } catch (RuntimeException e) {
+                NewXLogger.printException(() -> LOG_PREFIX + "could not open " + target, e);
             }
         }
 
@@ -250,7 +260,8 @@ public final class MagazineFeed {
     // ---------- Masonry grid ----------
 
     private interface CardClick {
-        void open(PostCard card);
+        /** {@code mediaPath} is null for the post itself, else e.g. "photo/1" or "video/1". */
+        void open(PostCard card, String mediaPath);
     }
 
     /** Each card goes into the currently shortest column, in timeline order. */
@@ -277,7 +288,7 @@ public final class MagazineFeed {
                 for (int i = 0; i < cards.size(); i++) {
                     // Same post, newer item object: keep the view, refresh the tap target.
                     PostCard card = next.get(i);
-                    getChildAt(i).setOnClickListener(view -> click.open(card));
+                    getChildAt(i).setOnClickListener(view -> click.open(card, null));
                 }
                 for (int i = cards.size(); i < next.size(); i++) {
                     addView(CardViews.build(getContext(), next.get(i), click));
@@ -364,7 +375,7 @@ public final class MagazineFeed {
             });
             root.setClipToOutline(true);
             root.setClickable(true);
-            root.setOnClickListener(view -> click.open(card));
+            root.setOnClickListener(view -> click.open(card, null));
 
             if (card.repostedBy != null) {
                 TextView contextLine = text(context, "\u21BB " + card.repostedBy + " reposted", 13f, muted);
@@ -374,7 +385,10 @@ public final class MagazineFeed {
             }
 
             if (card.imageUrl != null) {
-                root.addView(media(context, card), new LinearLayout.LayoutParams(
+                View media = media(context, card);
+                // Tapping the media opens X's own photo viewer or video player for it.
+                media.setOnClickListener(view -> click.open(card, card.video ? "video/1" : "photo/1"));
+                root.addView(media, new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             }
 
@@ -505,6 +519,13 @@ public final class MagazineFeed {
             this.video = video;
             this.repostedBy = repostedBy;
             this.age = age;
+        }
+
+        /** In-app link to this post, or to one of its media when {@code mediaPath} is given. */
+        String link(String mediaPath) {
+            if (postId == null || handle == null) return null;
+            String base = "https://x.com/" + handle + "/status/" + postId;
+            return mediaPath == null ? base : base + "/" + mediaPath;
         }
 
         // Cards are equal when they show the same post; the item object changes every emission.
