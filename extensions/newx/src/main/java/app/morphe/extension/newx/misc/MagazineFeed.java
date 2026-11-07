@@ -392,8 +392,10 @@ public final class MagazineFeed {
 
             LinearLayout root = new LinearLayout(context);
             root.setOrientation(LinearLayout.VERTICAL);
-            root.setBackground(rounded(Theme.surfaceContainer(context), Theme.dpToPx(context, CARD_RADIUS_DP)));
-            root.setElevation(Theme.dpToPx(context, 2f));
+            GradientDrawable cardBackground = rounded(Theme.surfaceContainer(context), Theme.dpToPx(context, CARD_RADIUS_DP));
+            cardBackground.setStroke(Math.max(1, Theme.dpToPx(context, 1f)), Theme.dividerColor(context));
+            root.setBackground(cardBackground);
+            root.setElevation(Theme.dpToPx(context, 1f));
             clipToRoundRect(root, Theme.dpToPx(context, CARD_RADIUS_DP));
             root.setClickable(true);
             root.setOnClickListener(view -> openInX(context, card.postLink()));
@@ -609,7 +611,7 @@ public final class MagazineFeed {
                 frame.addView(image, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
                 String url = card.avatarUrl;
-                MediaThumbnailLoader.load(context, null, url, new MediaThumbnailLoader.Callback() {
+                CardImageLoader.load(largerAvatar(url), new CardImageLoader.Callback() {
                     @Override
                     public void onLoaded(Bitmap bitmap) {
                         if (!bitmap.isRecycled()) {
@@ -796,7 +798,7 @@ public final class MagazineFeed {
             addView(tile);
 
             String url = item.url;
-            MediaThumbnailLoader.load(context, mediumUrl(url), url, new MediaThumbnailLoader.Callback() {
+            CardImageLoader.load(mediumUrl(url), new CardImageLoader.Callback() {
                 @Override
                 public void onLoaded(Bitmap bitmap) {
                     if (!url.equals(image.getTag()) || bitmap.isRecycled()) return;
@@ -878,6 +880,116 @@ public final class MagazineFeed {
                 return url;
             }
         }
+    }
+
+    // ---------- Sharp image loading ----------
+
+    /**
+     * Downloads card images at the requested size. The gallery's MediaThumbnailLoader is not used
+     * here: it accepts any copy the app has cached under the same media key, which is often X's
+     * low-resolution preview, so card media looked blurred until the post had been opened.
+     */
+    private static final class CardImageLoader {
+        interface Callback {
+            void onLoaded(Bitmap bitmap);
+
+            void onFailed(boolean transientError);
+        }
+
+        private static final int MAX_BYTES = 12 * 1024 * 1024;
+        // Sharp at card size (cards are at most ~1/2 of a tablet screen wide) while bounded: every
+        // card keeps its image while the feed is open, so full-size originals would exhaust memory.
+        private static final int MAX_DIMENSION = 1000;
+        private static final java.util.concurrent.ExecutorService EXECUTOR =
+                java.util.concurrent.Executors.newFixedThreadPool(3);
+        private static final android.os.Handler MAIN = new android.os.Handler(android.os.Looper.getMainLooper());
+        private static final android.util.LruCache<String, Bitmap> CACHE =
+                new android.util.LruCache<>((int) Math.min(Integer.MAX_VALUE, Runtime.getRuntime().maxMemory() / 1024 / 12)) {
+                    @Override
+                    protected int sizeOf(String key, Bitmap value) {
+                        return Math.max(1, value.getByteCount() / 1024);
+                    }
+                };
+
+        private CardImageLoader() {
+        }
+
+        static void load(String url, Callback callback) {
+            if (!NewXUtils.isHttpUrl(url)) {
+                MAIN.post(() -> callback.onFailed(false));
+                return;
+            }
+            Bitmap cached = CACHE.get(url);
+            if (cached != null && !cached.isRecycled()) {
+                callback.onLoaded(cached);
+                return;
+            }
+            EXECUTOR.execute(() -> {
+                Bitmap bitmap = null;
+                boolean transientError = true;
+                java.net.HttpURLConnection connection = null;
+                try {
+                    connection = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    connection.setConnectTimeout(15_000);
+                    connection.setReadTimeout(20_000);
+                    int status = connection.getResponseCode();
+                    transientError = status >= 500 || status == 429;
+                    if (status == 200) {
+                        byte[] data = readAll(connection.getInputStream());
+                        if (data != null) bitmap = decode(data);
+                    }
+                } catch (java.io.IOException | RuntimeException e) {
+                    transientError = true;
+                } finally {
+                    if (connection != null) connection.disconnect();
+                }
+                Bitmap result = bitmap;
+                boolean retryable = transientError;
+                if (result != null) CACHE.put(url, result);
+                MAIN.post(() -> {
+                    if (result != null) callback.onLoaded(result);
+                    else callback.onFailed(retryable);
+                });
+            });
+        }
+
+        private static byte[] readAll(java.io.InputStream input) throws java.io.IOException {
+            try (java.io.InputStream in = input) {
+                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+                byte[] buffer = new byte[16 * 1024];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                    if (out.size() > MAX_BYTES) return null;
+                }
+                return out.toByteArray();
+            }
+        }
+
+        private static Bitmap decode(byte[] data) {
+            android.graphics.BitmapFactory.Options bounds = new android.graphics.BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeByteArray(data, 0, data.length, bounds);
+            int sample = 1;
+            while (Math.max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_DIMENSION) sample *= 2;
+            android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options();
+            options.inSampleSize = sample;
+            Bitmap bitmap = android.graphics.BitmapFactory.decodeByteArray(data, 0, data.length, options);
+            if (bitmap == null) return null;
+            int longest = Math.max(bitmap.getWidth(), bitmap.getHeight());
+            if (longest <= MAX_DIMENSION) return bitmap;
+            float scale = MAX_DIMENSION / (float) longest;
+            Bitmap scaled = Bitmap.createScaledBitmap(bitmap,
+                    Math.max(1, Math.round(bitmap.getWidth() * scale)),
+                    Math.max(1, Math.round(bitmap.getHeight() * scale)), true);
+            if (scaled != bitmap) bitmap.recycle();
+            return scaled;
+        }
+    }
+
+    /** X serves profile pictures in sizes; "_normal" (48px) looks soft at card size. */
+    private static String largerAvatar(String url) {
+        return url == null ? null : url.replace("_normal.", "_200x200.");
     }
 
     // ---------- Reading posts out of timeline items ----------
