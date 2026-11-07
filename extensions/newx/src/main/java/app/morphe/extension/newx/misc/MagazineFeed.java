@@ -753,14 +753,9 @@ public final class MagazineFeed {
                     likeState.active ? "\u2665" : "\u2661",
                     likeState.active ? "ic_vector_heart" : "ic_vector_heart_stroke", "ic_vector_heart");
             paintLike.run();
-            like.setOnClickListener(view -> {
-                if (likeState.active) {
-                    // X's like link cannot undo; the post screen's heart can.
-                    openInX(context, card.postLink());
-                } else {
-                    openInX(context, card.intentLink("like", "tweet_id"));
-                }
-            });
+            // The post screen's own heart likes and unlikes in one tap; X's like link would ask
+            // for confirmation every time.
+            like.setOnClickListener(view -> openInX(context, card.postLink()));
 
             ToggleState bookmarkState = new ToggleState(e.bookmarked, null);
             LinearLayout bookmark = (LinearLayout) iconButton(context, "Bookmark", muted, null, "\u2606", "ic_vector_bookmark_stroke");
