@@ -314,11 +314,19 @@ public final class MagazineFeed {
                 columnOf.clear();
                 for (PostCard card : next) addView(CardViews.build(getContext(), card));
             } else {
+                // Same posts in the same places: redraw only cards whose counts or state changed,
+                // e.g. after liking a post X sends the post again with the new count.
+                for (int i = 0; i < cards.size(); i++) {
+                    if (!cards.get(i).engagement.sameAs(next.get(i).engagement)) {
+                        removeViewAt(i);
+                        addView(CardViews.build(getContext(), next.get(i)), i);
+                    }
+                }
                 for (int i = cards.size(); i < next.size(); i++) {
                     addView(CardViews.build(getContext(), next.get(i)));
                 }
             }
-            if (!appendOnly || next.size() != cards.size()) requestLayout();
+            requestLayout();
             cards = next;
         }
 
@@ -475,7 +483,9 @@ public final class MagazineFeed {
                 name.setEllipsize(TextUtils.TruncateAt.END);
                 who.addView(name);
             }
-            String sub = joinNonNull(card.handle == null ? null : "@" + card.handle, card.age);
+            String views = formatCount(card.engagement.views);
+            String sub = joinNonNull(joinNonNull(card.handle == null ? null : "@" + card.handle, card.age),
+                    views == null ? null : views + " views");
             if (sub != null) {
                 TextView handle = text(context, sub, 13f, muted);
                 handle.setSingleLine(true);
@@ -484,7 +494,7 @@ public final class MagazineFeed {
             }
             head.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-            View more = iconButton(context, "More", muted, "\u22EF", "ic_vector_overflow", "ic_vector_more");
+            View more = iconButton(context, "More", muted, null, "\u22EF", "ic_vector_overflow", "ic_vector_more");
             more.setOnClickListener(view -> showMoreMenu(view, card));
             head.addView(more);
             return head;
@@ -512,6 +522,9 @@ public final class MagazineFeed {
             menu.show();
         }
 
+        private static final int LIKE_COLOR = 0xFFF91880;
+        private static final int REPOST_COLOR = 0xFF00BA7C;
+
         private static View actions(Context context, PostCard card, int muted) {
             LinearLayout row = new LinearLayout(context);
             row.setOrientation(LinearLayout.HORIZONTAL);
@@ -519,20 +532,41 @@ public final class MagazineFeed {
             LinearLayout.LayoutParams rowParams = matchWidth();
             rowParams.topMargin = Theme.dpToPx(context, 6f);
             row.setLayoutParams(rowParams);
+            Engagement e = card.engagement;
+            int accent = Theme.primaryAccent(context);
 
-            View reply = iconButton(context, "Reply", muted, "\u21A9", "ic_vector_reply_stroke", "ic_vector_reply");
+            View reply = iconButton(context, "Reply", muted, e.replies, "\u21A9",
+                    "ic_vector_reply_stroke", "ic_vector_reply");
             reply.setOnClickListener(view -> openInX(context, card.intentLink("post", "in_reply_to")));
-            View repost = iconButton(context, "Repost", muted, "\u21BB", "ic_vector_retweet_stroke", "ic_vector_retweet");
+
+            View repost = iconButton(context, e.reposted ? "Undo repost" : "Repost",
+                    e.reposted ? REPOST_COLOR : muted, e.reposts, "\u21BB",
+                    e.reposted ? "ic_vector_retweet" : "ic_vector_retweet_stroke", "ic_vector_retweet");
+            // X's repost screen offers repost, quote and undo.
             repost.setOnClickListener(view -> openInX(context, card.intentLink("retweet", "tweet_id")));
-            View like = iconButton(context, "Like", muted, "\u2661", "ic_vector_heart_stroke", "ic_vector_heart");
-            like.setOnClickListener(view -> openInX(context, card.intentLink("like", "tweet_id")));
-            View bookmark = iconButton(context, "Bookmark", muted, "\u2606", "ic_vector_bookmark_stroke", "ic_vector_bookmark");
+
+            View like = iconButton(context, e.liked ? "Unlike" : "Like",
+                    e.liked ? LIKE_COLOR : muted, e.likes, e.liked ? "\u2665" : "\u2661",
+                    e.liked ? "ic_vector_heart" : "ic_vector_heart_stroke", "ic_vector_heart");
+            like.setOnClickListener(view -> {
+                if (e.liked) {
+                    // X's like link cannot undo; the post screen's heart can.
+                    openInX(context, card.postLink());
+                } else {
+                    openInX(context, card.intentLink("like", "tweet_id"));
+                }
+            });
+
+            View bookmark = iconButton(context, e.bookmarked ? "Remove bookmark" : "Bookmark",
+                    e.bookmarked ? accent : muted, null, e.bookmarked ? "\u2605" : "\u2606",
+                    e.bookmarked ? "ic_vector_bookmark" : "ic_vector_bookmark_stroke", "ic_vector_bookmark");
             bookmark.setOnClickListener(view -> {
                 // X has no bookmark link; its own bookmark button is on the post screen.
                 Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
                 openInX(context, card.postLink());
             });
-            View share = iconButton(context, "Share", muted, "\u2197", "ic_vector_share_android", "ic_vector_share");
+            View share = iconButton(context, "Share", muted, null, "\u2197",
+                    "ic_vector_share_android", "ic_vector_share");
             share.setOnClickListener(view -> sharePost(context, card));
 
             // Reply, repost and like spread out; bookmark and share sit at the end, as on X.
@@ -545,15 +579,19 @@ public final class MagazineFeed {
         }
 
         /**
-         * A 40dp touch target with X's own icon when the app still ships it, else a text glyph.
-         * The label is the accessibility description.
+         * A 40dp touch target with X's own icon when the app ships it (else a text glyph), and the
+         * count beside it when there is one. The label and count form the spoken description.
          */
-        private static View iconButton(Context context, String label, int color, String glyph, String... iconNames) {
+        private static View iconButton(Context context, String label, int color, Long count,
+                                       String glyph, String... iconNames) {
             int size = Theme.dpToPx(context, 40f);
-            FrameLayout button = new FrameLayout(context);
+            LinearLayout button = new LinearLayout(context);
+            button.setOrientation(LinearLayout.HORIZONTAL);
+            button.setGravity(Gravity.CENTER_VERTICAL);
             button.setMinimumWidth(size);
             button.setMinimumHeight(size);
-            button.setContentDescription(label);
+            String countText = formatCount(count);
+            button.setContentDescription(countText == null ? label : label + ", " + countText);
             button.setClickable(true);
             button.setFocusable(true);
             TypedValue ripple = new TypedValue();
@@ -567,19 +605,41 @@ public final class MagazineFeed {
                 image.setImageDrawable(icon);
                 image.setImageTintList(ColorStateList.valueOf(color));
                 int iconSize = Theme.dpToPx(context, 18f);
-                button.addView(image, new FrameLayout.LayoutParams(iconSize, iconSize, Gravity.CENTER_VERTICAL | Gravity.START));
+                button.addView(image, new LinearLayout.LayoutParams(iconSize, iconSize));
                 inner = image;
             } else {
                 TextView text = text(context, glyph, 17f, color);
-                button.addView(text, new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                        Gravity.CENTER_VERTICAL | Gravity.START));
+                button.addView(text);
                 inner = text;
             }
             inner.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            if (countText != null) {
+                TextView counter = text(context, countText, 13f, color);
+                counter.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                params.leftMargin = Theme.dpToPx(context, 5f);
+                button.addView(counter, params);
+            }
             int horizontal = Theme.dpToPx(context, 6f);
             button.setPadding(horizontal, 0, horizontal, 0);
             return button;
+        }
+
+        /** 999, 1.2K, 34K, 1.5M, as X abbreviates counts. */
+        static String formatCount(Long count) {
+            if (count == null || count <= 0) return null;
+            long n = count;
+            if (n < 1_000) return Long.toString(n);
+            if (n < 10_000) return trimZero(n / 1_000.0) + "K";
+            if (n < 1_000_000) return (n / 1_000) + "K";
+            if (n < 10_000_000) return trimZero(n / 1_000_000.0) + "M";
+            return (n / 1_000_000) + "M";
+        }
+
+        private static String trimZero(double value) {
+            String text = String.format(java.util.Locale.ROOT, "%.1f", Math.floor(value * 10) / 10);
+            return text.endsWith(".0") ? text.substring(0, text.length() - 2) : text;
         }
 
         private static Drawable findIcon(Context context, String... names) {
@@ -998,6 +1058,81 @@ public final class MagazineFeed {
         return handle == null ? null : "https://x.com/" + handle;
     }
 
+    /**
+     * Counts and the viewer's own state, from the post's inline action entries, the same list
+     * X's action bar is built from:
+     * {@code inlineActionEntry=[InlineActionEntry(actionType=Favorite, count=12, isEnabled=true), ...]}.
+     * The entry types say the state: Unfavorite means already liked, UndoRetweet already reposted,
+     * RemoveFromBookmarks already bookmarked.
+     */
+    private static final class Engagement {
+        static final Engagement NONE = new Engagement(null, null, null, null, false, false, false);
+
+        final Long replies;
+        final Long reposts;
+        final Long likes;
+        final Long views;
+        final boolean liked;
+        final boolean reposted;
+        final boolean bookmarked;
+
+        private Engagement(Long replies, Long reposts, Long likes, Long views,
+                           boolean liked, boolean reposted, boolean bookmarked) {
+            this.replies = replies;
+            this.reposts = reposts;
+            this.likes = likes;
+            this.views = views;
+            this.liked = liked;
+            this.reposted = reposted;
+            this.bookmarked = bookmarked;
+        }
+
+        static Engagement of(String post) {
+            String entries = ToStringParser.fieldValue(post, "inlineActionEntry");
+            if (entries == null) return NONE;
+            Long replies = null, reposts = null, likes = null, views = null;
+            boolean liked = false, reposted = false, bookmarked = false;
+            int offset = 0;
+            while (true) {
+                int start = entries.indexOf("InlineActionEntry(", offset);
+                if (start < 0) break;
+                int close = entries.indexOf(')', start);
+                if (close < 0) break;
+                String entry = entries.substring(start, close + 1);
+                offset = close + 1;
+                String type = ToStringParser.fieldValue(entry, "actionType");
+                Long count = parseLong(ToStringParser.fieldValue(entry, "count"));
+                if (type == null) continue;
+                switch (type) {
+                    case "Reply" -> replies = count;
+                    case "Retweet" -> reposts = count;
+                    case "UndoRetweet" -> { reposts = count; reposted = true; }
+                    case "Favorite" -> likes = count;
+                    case "Unfavorite" -> { likes = count; liked = true; }
+                    case "RemoveFromBookmarks" -> bookmarked = true;
+                    case "ViewCount" -> views = count;
+                    default -> { }
+                }
+            }
+            return new Engagement(replies, reposts, likes, views, liked, reposted, bookmarked);
+        }
+
+        boolean sameAs(Engagement other) {
+            return liked == other.liked && reposted == other.reposted && bookmarked == other.bookmarked
+                    && Objects.equals(replies, other.replies) && Objects.equals(reposts, other.reposts)
+                    && Objects.equals(likes, other.likes) && Objects.equals(views, other.views);
+        }
+
+        private static Long parseLong(String value) {
+            if (value == null) return null;
+            try {
+                return Long.parseLong(value.trim());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+    }
+
     /** Anything with a post address that media tiles can link into. */
     private interface LinkSource {
         String mediaLink(String mediaPath);
@@ -1057,10 +1192,12 @@ public final class MagazineFeed {
         final String age;
         final boolean sensitiveMedia;
         final String coverText;
+        final Engagement engagement;
 
         private PostCard(String postId, String name, String handle, String avatarUrl, String text,
                          List<MediaItem> media, String repostedBy, String replyingTo,
-                         QuotedPost quote, String age, boolean sensitiveMedia, String coverText) {
+                         QuotedPost quote, String age, boolean sensitiveMedia, String coverText,
+                         Engagement engagement) {
             this.postId = postId;
             this.name = name;
             this.handle = handle;
@@ -1073,6 +1210,7 @@ public final class MagazineFeed {
             this.age = age;
             this.sensitiveMedia = sensitiveMedia;
             this.coverText = coverText;
+            this.engagement = engagement;
         }
 
         String postLink() {
@@ -1181,7 +1319,8 @@ public final class MagazineFeed {
                     quoteOf(quoted, showSensitive),
                     age(ToStringParser.fieldValue(shown, "timestamp")),
                     sensitiveMedia,
-                    coverText
+                    coverText,
+                    Engagement.of(shown)
             );
         }
 
