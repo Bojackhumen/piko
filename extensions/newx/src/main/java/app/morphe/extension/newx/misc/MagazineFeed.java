@@ -197,6 +197,7 @@ public final class MagazineFeed {
     /** Opens an x.com link inside X itself; X's deep-link router picks the screen. */
     private static void openInX(Context context, String url) {
         if (url == null) return;
+        dismissFocus();
         Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
         intent.setPackage(context.getPackageName());
         // In-app navigation, not an outside post link: Piko's refresh gate must not let this
@@ -213,6 +214,122 @@ public final class MagazineFeed {
     /** The post link with Piko's sharing settings applied (custom domain, permanent links, tracking). */
     private static String shareLink(PostCard card) {
         return ShareUrlResolver.rewriteSharedUrl(card.postLink());
+    }
+
+    // ---------- Focus view: the card enlarged over a blurred timeline ----------
+
+    private static android.app.Dialog focusDialog;
+
+    private static void dismissFocus() {
+        if (focusDialog != null) {
+            try {
+                focusDialog.dismiss();
+            } catch (RuntimeException ignored) {
+            }
+            focusDialog = null;
+        }
+    }
+
+    /**
+     * Pops the card out, enlarged in the middle of the screen, with the timeline blurred (or
+     * dimmed where the device has no window blur) behind it. Tapping outside, back, or the close
+     * button returns to the timeline untouched; nothing is navigated.
+     */
+    private static void showFocus(Context context, PostCard card) {
+        Activity activity = NewXUtils.findActivity(context);
+        if (activity == null || activity.isFinishing()) {
+            openInX(context, card.postLink());
+            return;
+        }
+        dismissFocus();
+        android.app.Dialog dialog = new android.app.Dialog(activity);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+
+        FrameLayout scrim = new FrameLayout(activity);
+        scrim.setOnClickListener(view -> dialog.dismiss());
+        scrim.setContentDescription("Close");
+
+        int screenWidth = activity.getResources().getDisplayMetrics().widthPixels;
+        int margin = Theme.dpToPx(activity, 16f);
+        int width = Math.min(screenWidth - 2 * margin, Theme.dpToPx(activity, 720f));
+
+        android.widget.ScrollView scroll = new android.widget.ScrollView(activity);
+        scroll.setVerticalScrollBarEnabled(false);
+        scroll.setClipToPadding(false);
+        scroll.setPadding(0, margin * 2, 0, margin * 2);
+
+        scroll.setFillViewport(true);
+        LinearLayout column = new LinearLayout(activity);
+        column.setOrientation(LinearLayout.VERTICAL);
+        // Short cards sit in the middle; empty space around the card closes, like the scrim.
+        column.setGravity(Gravity.CENTER_VERTICAL);
+        column.setOnClickListener(view -> dialog.dismiss());
+
+        TextView close = CardViews.text(activity, "\u2715", 18f, Color.WHITE);
+        close.setGravity(Gravity.CENTER);
+        close.setContentDescription("Close");
+        GradientDrawable closeBackground = new GradientDrawable();
+        closeBackground.setShape(GradientDrawable.OVAL);
+        closeBackground.setColor(0x66000000);
+        close.setBackground(closeBackground);
+        close.setOnClickListener(view -> dialog.dismiss());
+        int closeSize = Theme.dpToPx(activity, 40f);
+        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(closeSize, closeSize);
+        closeParams.gravity = Gravity.END;
+        closeParams.bottomMargin = Theme.dpToPx(activity, 8f);
+        column.addView(close, closeParams);
+
+        View enlarged = CardViews.build(activity, card, true);
+        column.addView(enlarged, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView openFull = CardViews.text(activity, "Open full post \u00B7 replies", 15f, Theme.onPrimaryAccent(activity));
+        CardViews.bold(openFull);
+        openFull.setGravity(Gravity.CENTER);
+        int buttonPadding = Theme.dpToPx(activity, 12f);
+        openFull.setPadding(buttonPadding, buttonPadding, buttonPadding, buttonPadding);
+        openFull.setBackground(CardViews.rounded(Theme.primaryAccent(activity), Theme.dpToPx(activity, 24f)));
+        openFull.setOnClickListener(view -> openInX(activity, card.postLink()));
+        LinearLayout.LayoutParams openParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        openParams.topMargin = Theme.dpToPx(activity, 12f);
+        column.addView(openFull, openParams);
+
+        scroll.addView(column, new FrameLayout.LayoutParams(width, ViewGroup.LayoutParams.WRAP_CONTENT));
+        scrim.addView(scroll, new FrameLayout.LayoutParams(width, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER_HORIZONTAL));
+        dialog.setContentView(scrim, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        android.view.Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            android.view.WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.dimAmount = 0.45f;
+            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                android.view.WindowManager windowManager = activity.getSystemService(android.view.WindowManager.class);
+                // Cross-window blur can be off (battery saver, some devices); dimming remains then.
+                if (windowManager != null && windowManager.isCrossWindowBlurEnabled()) {
+                    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
+                    attributes.setBlurBehindRadius(Theme.dpToPx(activity, 28f));
+                    attributes.dimAmount = 0.25f;
+                }
+            }
+            window.setAttributes(attributes);
+        }
+
+        // Pop out from slightly smaller, as a card lifted off the timeline.
+        enlarged.setScaleX(0.92f);
+        enlarged.setScaleY(0.92f);
+        enlarged.setAlpha(0f);
+        dialog.setOnShowListener(d -> enlarged.animate().scaleX(1f).scaleY(1f).alpha(1f)
+                .setDuration(200).setInterpolator(new android.view.animation.DecelerateInterpolator()).start());
+        dialog.setOnDismissListener(d -> {
+            if (focusDialog == dialog) focusDialog = null;
+        });
+        focusDialog = dialog;
+        dialog.show();
     }
 
     private static void sharePost(Context context, PostCard card) {
@@ -538,6 +655,11 @@ public final class MagazineFeed {
         }
 
         static View build(Context context, PostCard card) {
+            return build(context, card, false);
+        }
+
+        /** {@code focal}: the enlarged card of the focus view (full text, larger type). */
+        static View build(Context context, PostCard card, boolean focal) {
             int pad = Theme.dpToPx(context, 14f);
             int ink = Theme.primaryText(context);
             int muted = Theme.secondaryText(context);
@@ -550,7 +672,11 @@ public final class MagazineFeed {
             root.setElevation(Theme.dpToPx(context, 1f));
             clipToRoundRect(root, Theme.dpToPx(context, CARD_RADIUS_DP));
             root.setClickable(true);
-            root.setOnClickListener(view -> openInX(context, card.postLink()));
+            // A timeline card pops out into the focus view; the enlarged card itself stays put.
+            View.OnClickListener popOut = focal ? null : view -> showFocus(context, card);
+            root.setOnClickListener(view -> {
+                if (popOut != null) popOut.onClick(view);
+            });
             root.setContentDescription(card.describe());
 
             if (card.repostedBy != null) {
@@ -563,7 +689,7 @@ public final class MagazineFeed {
             if (card.coverText == null && !card.media.isEmpty()) {
                 root.addView(card.sensitiveMedia
                         ? sensitiveTile(context, card)
-                        : mediaBlock(context, card.media, card), matchWidth());
+                        : mediaBlock(context, card.media, card, popOut), matchWidth());
             }
 
             LinearLayout body = new LinearLayout(context);
@@ -583,10 +709,14 @@ public final class MagazineFeed {
             // where X's own reveal control is.
             String bodyText = card.coverText != null ? "\u26A0 " + card.coverText : card.text;
             if (bodyText != null) {
-                TextView text = text(context, bodyText, 16f, card.coverText != null ? muted : ink);
-                text.setLineSpacing(0f, 1.2f);
-                text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
-                text.setEllipsize(TextUtils.TruncateAt.END);
+                TextView text = text(context, bodyText, focal ? 19f : 16f, card.coverText != null ? muted : ink);
+                text.setLineSpacing(0f, focal ? 1.25f : 1.2f);
+                if (!focal) {
+                    text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
+                    text.setEllipsize(TextUtils.TruncateAt.END);
+                } else {
+                    text.setTextIsSelectable(true);
+                }
                 LinearLayout.LayoutParams params = matchWidth();
                 params.topMargin = Theme.dpToPx(context, 8f);
                 body.addView(text, params);
@@ -595,7 +725,7 @@ public final class MagazineFeed {
             if (card.quote != null && card.coverText == null) {
                 LinearLayout.LayoutParams params = matchWidth();
                 params.topMargin = Theme.dpToPx(context, 12f);
-                body.addView(quoteBox(context, card.quote, ink, muted), params);
+                body.addView(quoteBox(context, card.quote, ink, muted, popOut), params);
             }
 
             body.addView(actions(context, card, muted));
@@ -891,7 +1021,8 @@ public final class MagazineFeed {
             return tile;
         }
 
-        private static View quoteBox(Context context, QuotedPost quote, int ink, int muted) {
+        private static View quoteBox(Context context, QuotedPost quote, int ink, int muted,
+                                     View.OnClickListener popOut) {
             LinearLayout box = new LinearLayout(context);
             box.setOrientation(LinearLayout.VERTICAL);
             GradientDrawable outline = new GradientDrawable();
@@ -901,11 +1032,11 @@ public final class MagazineFeed {
             box.setBackground(outline);
             clipToRoundRect(box, radius);
             box.setClickable(true);
-            box.setOnClickListener(view -> openInX(context, quote.link()));
+            box.setOnClickListener(popOut != null ? popOut : view -> openInX(context, quote.link()));
             box.setContentDescription("Quoted post" + (quote.name == null ? "" : " by " + quote.name));
 
             if (!quote.media.isEmpty()) {
-                box.addView(mediaBlock(context, quote.media.subList(0, 1), quote), matchWidth());
+                box.addView(mediaBlock(context, quote.media.subList(0, 1), quote, popOut), matchWidth());
             }
             LinearLayout inner = new LinearLayout(context);
             inner.setOrientation(LinearLayout.VERTICAL);
@@ -933,7 +1064,8 @@ public final class MagazineFeed {
          * Up to four media tiles, as in the userscript: one row, or two rows of two for four
          * items. Each tile keeps its real shape; tiles in a row share one height.
          */
-        private static View mediaBlock(Context context, List<MediaItem> items, LinkSource source) {
+        private static View mediaBlock(Context context, List<MediaItem> items, LinkSource source,
+                                       View.OnClickListener popOut) {
             List<MediaItem> shown = items.size() > MAX_MEDIA ? items.subList(0, MAX_MEDIA) : items;
             LinearLayout block = new LinearLayout(context);
             block.setOrientation(LinearLayout.VERTICAL);
@@ -953,7 +1085,8 @@ public final class MagazineFeed {
                     MediaItem item = shown.get(index);
                     // X's photo viewer counts media positions from 1; videos open the player.
                     String path = item.video ? "video/1" : "photo/" + (index + 1);
-                    row.addTile(context, item, view -> openInX(context, source.mediaLink(path)));
+                    // On the timeline media pops the card out; in the focus view it opens X's viewer.
+                    row.addTile(context, item, popOut != null ? popOut : view -> openInX(context, source.mediaLink(path)));
                 }
                 LinearLayout.LayoutParams params = matchWidth();
                 if (r > 0) params.topMargin = gap;
