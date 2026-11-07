@@ -1754,8 +1754,25 @@ public final class MagazineFeed {
             this.bookmarked = bookmarked;
         }
 
+        // Logged once per process, when Piko logging is on, so the real timeline shape is visible.
+        private static volatile boolean loggedSample;
+
         static Engagement of(String post) {
             String entries = ToStringParser.fieldValue(post, "inlineActionEntry");
+            Engagement result = parse(entries);
+            if (!loggedSample && NewXLogger.isLoggingEnabled()) {
+                loggedSample = true;
+                String sample = entries == null ? "(no inlineActionEntry field)"
+                        : entries.length() > 500 ? entries.substring(0, 500) + "\u2026" : entries;
+                log("engagement sample inlineActionEntry=" + sample);
+                log("engagement parsed replies=" + result.replies + " reposts=" + result.reposts
+                        + " likes=" + result.likes + " views=" + result.views + " liked=" + result.liked
+                        + " reposted=" + result.reposted + " bookmarked=" + result.bookmarked);
+            }
+            return result;
+        }
+
+        private static Engagement parse(String entries) {
             if (entries == null) return NONE;
             Long replies = null, reposts = null, likes = null, views = null;
             boolean liked = false, reposted = false, bookmarked = false;
@@ -1763,7 +1780,8 @@ public final class MagazineFeed {
             while (true) {
                 int start = entries.indexOf("InlineActionEntry(", offset);
                 if (start < 0) break;
-                int close = entries.indexOf(')', start);
+                // Balanced parens, so a field that itself prints "(...)" cannot cut the entry short.
+                int close = balancedClose(entries, entries.indexOf('(', start));
                 if (close < 0) break;
                 String entry = entries.substring(start, close + 1);
                 offset = close + 1;
@@ -1782,6 +1800,17 @@ public final class MagazineFeed {
                 }
             }
             return new Engagement(replies, reposts, likes, views, liked, reposted, bookmarked);
+        }
+
+        private static int balancedClose(String text, int open) {
+            if (open < 0) return -1;
+            int depth = 0;
+            for (int i = open; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '(') depth++;
+                else if (c == ')' && --depth == 0) return i;
+            }
+            return -1;
         }
 
         boolean sameAs(Engagement other) {
