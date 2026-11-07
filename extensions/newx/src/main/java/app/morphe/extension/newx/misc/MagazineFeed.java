@@ -117,6 +117,30 @@ public final class MagazineFeed {
         NewXLogger.printInfo(() -> LOG_PREFIX + message);
     }
 
+    // ---------- Opening things in X ----------
+
+    /** Opens an x.com link inside X itself; X's deep-link router picks the screen. */
+    private static void openInX(Context context, String url) {
+        if (url == null) return;
+        dismissFocus();
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        intent.setPackage(context.getPackageName());
+        // In-app navigation, not an outside post link: Piko's refresh gate must not let this
+        // refresh the home timeline (it would with "Disable automatic timeline refresh" on).
+        intent.putExtra(app.morphe.extension.newx.timeline.TimelineRefreshGate.INTERNAL_NAVIGATION_EXTRA, true);
+        if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            context.startActivity(intent);
+        } catch (RuntimeException e) {
+            NewXLogger.printException(() -> LOG_PREFIX + "could not open " + url, e);
+        }
+    }
+
+    /** The post link with Piko's sharing settings applied (custom domain, permanent links, tracking). */
+    private static String shareLink(PostCard card) {
+        return ShareUrlResolver.rewriteSharedUrl(card.postLink());
+    }
+
     // ---------- Focus view: the card enlarged over a blurred timeline ----------
 
     private static android.app.Dialog focusDialog;
