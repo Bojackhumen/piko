@@ -77,6 +77,8 @@ public final class MagazineFeed {
     private static final float MAX_ASPECT = 3f;
     private static final float UNKNOWN_ASPECT = 16f / 9f;
     private static final String LOG_PREFIX = "[PikoNewX][Magazine] ";
+    // Piko's "Show sensitive media". Off: X's warnings are kept, so cards keep them too.
+    private static final String SHOW_SENSITIVE_SETTING = "newx.content.show_sensitive_media";
 
     private MagazineFeed() {
     }
@@ -130,8 +132,13 @@ public final class MagazineFeed {
         }
     }
 
+    /** The post link with Piko's sharing settings applied (custom domain, permanent links, tracking). */
+    private static String shareLink(PostCard card) {
+        return ShareUrlResolver.rewriteSharedUrl(card.postLink());
+    }
+
     private static void sharePost(Context context, PostCard card) {
-        String link = card.postLink();
+        String link = shareLink(card);
         if (link == null) return;
         Intent send = new Intent(Intent.ACTION_SEND);
         send.setType("text/plain");
@@ -146,7 +153,7 @@ public final class MagazineFeed {
     }
 
     private static void copyLink(Context context, PostCard card) {
-        String link = card.postLink();
+        String link = shareLink(card);
         ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
         if (link == null || clipboard == null) return;
         clipboard.setPrimaryClip(ClipData.newPlainText("Post link", link));
@@ -394,13 +401,15 @@ public final class MagazineFeed {
 
             if (card.repostedBy != null) {
                 TextView contextLine = text(context, "\u21BB " + card.repostedBy + " reposted", 13f, muted);
-                contextLine.setTypeface(Typeface.DEFAULT_BOLD);
+                bold(contextLine);
                 contextLine.setPadding(pad, pad - Theme.dpToPx(context, 2f), pad, Theme.dpToPx(context, 8f));
                 root.addView(contextLine);
             }
 
-            if (!card.media.isEmpty()) {
-                root.addView(mediaBlock(context, card.media, card), matchWidth());
+            if (card.coverText == null && !card.media.isEmpty()) {
+                root.addView(card.sensitiveMedia
+                        ? sensitiveTile(context, card)
+                        : mediaBlock(context, card.media, card), matchWidth());
             }
 
             LinearLayout body = new LinearLayout(context);
@@ -416,8 +425,11 @@ public final class MagazineFeed {
 
             body.addView(header(context, card, ink, muted));
 
-            if (card.text != null) {
-                TextView text = text(context, card.text, 16f, ink);
+            // A post X covers with a warning shows only that warning; the post opens on tap,
+            // where X's own reveal control is.
+            String bodyText = card.coverText != null ? "\u26A0 " + card.coverText : card.text;
+            if (bodyText != null) {
+                TextView text = text(context, bodyText, 16f, card.coverText != null ? muted : ink);
                 text.setLineSpacing(0f, 1.2f);
                 text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
                 text.setEllipsize(TextUtils.TruncateAt.END);
@@ -426,7 +438,7 @@ public final class MagazineFeed {
                 body.addView(text, params);
             }
 
-            if (card.quote != null) {
+            if (card.quote != null && card.coverText == null) {
                 LinearLayout.LayoutParams params = matchWidth();
                 params.topMargin = Theme.dpToPx(context, 12f);
                 body.addView(quoteBox(context, card.quote, ink, muted), params);
@@ -456,7 +468,7 @@ public final class MagazineFeed {
             who.setOnClickListener(openProfile);
             if (card.name != null) {
                 TextView name = text(context, card.name, 14.5f, ink);
-                name.setTypeface(Typeface.DEFAULT_BOLD);
+                bold(name);
                 name.setSingleLine(true);
                 name.setEllipsize(TextUtils.TruncateAt.END);
                 who.addView(name);
@@ -614,6 +626,18 @@ public final class MagazineFeed {
             return frame;
         }
 
+        /** Stands in for media X marks sensitive; tapping opens the post with X's own warning. */
+        private static View sensitiveTile(Context context, PostCard card) {
+            TextView tile = text(context, "Sensitive media \u00B7 Tap to view", 14f, Theme.secondaryText(context));
+            tile.setGravity(Gravity.CENTER);
+            int vertical = Theme.dpToPx(context, 40f);
+            tile.setPadding(Theme.dpToPx(context, 12f), vertical, Theme.dpToPx(context, 12f), vertical);
+            tile.setBackgroundColor(Theme.dividerColor(context));
+            tile.setClickable(true);
+            tile.setOnClickListener(view -> openInX(context, card.postLink()));
+            return tile;
+        }
+
         private static View quoteBox(Context context, QuotedPost quote, int ink, int muted) {
             LinearLayout box = new LinearLayout(context);
             box.setOrientation(LinearLayout.VERTICAL);
@@ -636,7 +660,7 @@ public final class MagazineFeed {
             inner.setPadding(pad + Theme.dpToPx(context, 2f), pad, pad + Theme.dpToPx(context, 2f), pad);
             String who = joinNonNull(quote.name, quote.handle == null ? null : "@" + quote.handle);
             TextView author = text(context, who == null ? "Quoted post" : who, 13.5f, quote.name == null ? muted : ink);
-            author.setTypeface(Typeface.DEFAULT_BOLD);
+            bold(author);
             author.setSingleLine(true);
             author.setEllipsize(TextUtils.TruncateAt.END);
             inner.addView(author);
@@ -691,7 +715,13 @@ public final class MagazineFeed {
             view.setTextSize(sp);
             view.setTextColor(color);
             view.setIncludeFontPadding(false);
+            // Piko's custom or system font, when set; the plain default otherwise.
+            view.setTypeface(UpdateFont.customTypefaceOr(Typeface.DEFAULT));
             return view;
+        }
+
+        private static void bold(TextView view) {
+            view.setTypeface(UpdateFont.customTypefaceOr(Typeface.DEFAULT_BOLD));
         }
 
         private static GradientDrawable rounded(int color, float radius) {
@@ -913,10 +943,12 @@ public final class MagazineFeed {
         final String replyingTo;
         final QuotedPost quote;
         final String age;
+        final boolean sensitiveMedia;
+        final String coverText;
 
         private PostCard(String postId, String name, String handle, String avatarUrl, String text,
                          List<MediaItem> media, String repostedBy, String replyingTo,
-                         QuotedPost quote, String age) {
+                         QuotedPost quote, String age, boolean sensitiveMedia, String coverText) {
             this.postId = postId;
             this.name = name;
             this.handle = handle;
@@ -927,6 +959,8 @@ public final class MagazineFeed {
             this.replyingTo = replyingTo;
             this.quote = quote;
             this.age = age;
+            this.sensitiveMedia = sensitiveMedia;
+            this.coverText = coverText;
         }
 
         String postLink() {
@@ -1003,6 +1037,21 @@ public final class MagazineFeed {
             List<MediaItem> media = mediaOf(shown);
             String text = postText(shown);
             if (text != null && !media.isEmpty()) text = stripTrailingMediaLink(text);
+            if (text != null) text = expandLinks(text, shown);
+
+            // X's sensitive-content warnings live on the contextual post (Piko's "Show sensitive
+            // media" clears them at the model) and on each video. A repost carries them on both
+            // the wrapper and the original.
+            boolean showSensitive = SettingsRegistry.getBooleanOrDefault(SHOW_SENSITIVE_SETTING, false);
+            String coverText = null;
+            boolean sensitiveMedia = false;
+            if (!showSensitive) {
+                coverText = coverText(ownFields(value));
+                if (coverText == null && isRepost) coverText = coverText(ownFields(reposted));
+                sensitiveMedia = hasBlur(ownFields(value))
+                        || (isRepost && hasBlur(ownFields(reposted)))
+                        || hasMediaWarning(shown);
+            }
 
             String author = ToStringParser.fieldValue(shown, "author");
             String quotedSource = isRepost ? reposted : value;
@@ -1017,17 +1066,93 @@ public final class MagazineFeed {
                     media,
                     repostedBy,
                     ToStringParser.fieldValue(shown, "repliedToUserScreenName"),
-                    quoteOf(quoted),
-                    age(ToStringParser.fieldValue(shown, "timestamp"))
+                    quoteOf(quoted, showSensitive),
+                    age(ToStringParser.fieldValue(shown, "timestamp")),
+                    sensitiveMedia,
+                    coverText
             );
         }
 
-        private static QuotedPost quoteOf(String quoted) {
+        /** The post's own fields, without its nested quoted and reposted posts' fields. */
+        private static String ownFields(String contextual) {
+            String own = contextual;
+            for (String nested : new String[]{"quotedPost", "rePostedPost"}) {
+                String value = ToStringParser.fieldValue(own, nested);
+                if (value != null) own = own.replace(value, "");
+            }
+            return own;
+        }
+
+        /** TweetInterstitial(revealText=, displayText=, displayType=): X's whole-post warning. */
+        private static String coverText(String own) {
+            String interstitial = ToStringParser.fieldValue(own, "tweetInterstitial");
+            if (interstitial == null || !interstitial.startsWith("TweetInterstitial(")) return null;
+            String text = between(interstitial, "displayText=", ", displayType=");
+            return text != null ? text : "This post may contain sensitive content";
+        }
+
+        /** MediaVisibilityResults(blurImageInterstitial=BlurImageInterstitial(...)): blurred media. */
+        private static boolean hasBlur(String own) {
+            String visibility = ToStringParser.fieldValue(own, "mediaVisibilityResults");
+            return visibility != null && visibility.contains("BlurImageInterstitial(");
+        }
+
+        /** MediaContentVideo(..., sensitiveMediaWarning=SensitiveMediaWarning(...)). */
+        private static boolean hasMediaWarning(String post) {
+            String list = ToStringParser.fieldValue(post, "media");
+            return list != null && list.contains("sensitiveMediaWarning=SensitiveMediaWarning(");
+        }
+
+        private static String between(String text, String startMarker, String endMarker) {
+            int start = text.indexOf(startMarker);
+            if (start < 0) return null;
+            start += startMarker.length();
+            int end = text.indexOf(endMarker, start);
+            if (end < 0) return null;
+            String value = text.substring(start, end).trim();
+            return value.isEmpty() || value.equals("null") ? null : value;
+        }
+
+        /**
+         * Shows links the way X does: each t.co address in the text becomes its display form
+         * (PostEntityList(urls=[UrlEntity(..., displayUrl=, url=https://t.co/...)])). Tapping the
+         * card opens the post, where the link itself can be followed.
+         */
+        private static String expandLinks(String text, String post) {
+            String entities = ToStringParser.fieldValue(post, "entityList");
+            String urls = entities == null ? null : ToStringParser.fieldValue(entities, "urls");
+            if (urls == null) return text;
+            int offset = 0;
+            while (true) {
+                int start = urls.indexOf("UrlEntity(", offset);
+                if (start < 0) break;
+                int close = matchingClose(urls, urls.indexOf('(', start));
+                if (close < 0) break;
+                String entity = urls.substring(start, close + 1);
+                offset = close + 1;
+                String shortUrl = ToStringParser.fieldValue(entity, "url");
+                String display = ToStringParser.fieldValue(entity, "displayUrl");
+                if (shortUrl != null && display != null && shortUrl.startsWith("https://t.co/")) {
+                    text = text.replace(shortUrl, display);
+                }
+            }
+            return text;
+        }
+
+        private static QuotedPost quoteOf(String quoted, boolean showSensitive) {
             if (quoted == null || !quoted.contains("text=")) return null;
             String author = ToStringParser.fieldValue(quoted, "author");
             List<MediaItem> media = mediaOf(quoted);
             String text = postText(quoted);
             if (text != null && !media.isEmpty()) text = stripTrailingMediaLink(text);
+            if (text != null) text = expandLinks(text, quoted);
+            if (!showSensitive) {
+                String own = ownFields(quoted);
+                String cover = coverText(own);
+                if (cover != null) text = "\u26A0 " + cover;
+                // Warned quote media is left out; the quote box still opens the quoted post.
+                if (cover != null || hasBlur(own) || hasMediaWarning(quoted)) media = Collections.emptyList();
+            }
             return new QuotedPost(
                     ToStringParser.fieldValue(quoted, "id"),
                     author == null ? null : ToStringParser.fieldValue(author, "name"),
