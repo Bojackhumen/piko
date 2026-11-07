@@ -117,6 +117,88 @@ public final class MagazineFeed {
         NewXLogger.printInfo(() -> LOG_PREFIX + message);
     }
 
+    // ---------- One-tap actions through X's own post-actions service ----------
+
+    // X's post-actions service, captured by the patch when X's DI creates it. Null until then.
+    private static volatile Object postActions;
+
+    /** Patch hook: called from X's post-actions service constructor with the new instance. */
+    public static void capturePostActions(Object service) {
+        if (postActions == null) log("post actions service ready");
+        postActions = service;
+    }
+
+    // Patch-time bridges (bodies replaced by the patch). Unpatched, they throw, and the cards fall
+    // back to X's in-app links / the post screen.
+    private static Object postResultOf(Object timelineItem) {
+        throw new IllegalStateException("Piko 2.0 postResultOf bridge was not patched");
+    }
+
+    private static Object repostedOf(Object contextualPost) {
+        throw new IllegalStateException("Piko 2.0 repostedOf bridge was not patched");
+    }
+
+    private static void likePost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 likePost bridge was not patched");
+    }
+
+    private static void unlikePost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 unlikePost bridge was not patched");
+    }
+
+    private static void repostPost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 repostPost bridge was not patched");
+    }
+
+    private static void bookmarkPost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 bookmarkPost bridge was not patched");
+    }
+
+    private static void unbookmarkPost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 unbookmarkPost bridge was not patched");
+    }
+
+    private enum PostAction { LIKE, UNLIKE, REPOST, BOOKMARK, UNBOOKMARK }
+
+    /**
+     * Runs the action through X's own post-actions service, exactly as X's inline action bar does:
+     * like/unlike and repost carry X's scribe map (dispatcher mask 16), bookmark/unbookmark use X's
+     * empty-map path (mask 24). Returns false when that is not possible yet (service not created,
+     * not a plain post, or the bridge was left unpatched); callers then fall back to X's link or the
+     * post screen.
+     */
+    private static boolean runAction(PostCard card, PostAction action) {
+        Object service = postActions;
+        if (service == null) {
+            log("post actions service not ready; using the link for " + action);
+            return false;
+        }
+        try {
+            Object post = postResultOf(card.item);
+            if (post == null) return false;
+            if (card.repostedBy != null) {
+                // A repost card shows the original post; act on that one.
+                try {
+                    Object original = repostedOf(post);
+                    if (original != null) post = original;
+                } catch (RuntimeException ignored) {
+                }
+            }
+            switch (action) {
+                case LIKE -> likePost(service, post);
+                case UNLIKE -> unlikePost(service, post);
+                case REPOST -> repostPost(service, post);
+                case BOOKMARK -> bookmarkPost(service, post);
+                case UNBOOKMARK -> unbookmarkPost(service, post);
+            }
+            log(action + " sent for " + card.postId);
+            return true;
+        } catch (Throwable t) {
+            NewXLogger.printException(() -> LOG_PREFIX + action + " failed; using the link", t);
+            return false;
+        }
+    }
+
     // ---------- Opening things in X ----------
 
     /** Opens an x.com link inside X itself; X's deep-link router picks the screen. */
@@ -738,14 +820,27 @@ public final class MagazineFeed {
                     "ic_vector_reply_stroke", "ic_vector_reply");
             reply.setOnClickListener(view -> openInX(context, card.intentLink("post", "in_reply_to")));
 
-            View repost = iconButton(context, e.reposted ? "Undo repost" : "Repost",
-                    e.reposted ? REPOST_COLOR : muted, e.reposts, "\u21BB",
-                    e.reposted ? "ic_vector_retweet" : "ic_vector_retweet_stroke", "ic_vector_retweet");
-            // X's repost screen offers repost, quote and undo.
-            repost.setOnClickListener(view -> openInX(context, card.intentLink("retweet", "tweet_id")));
+            // One tap reposts through X's own service and updates the button at once. Undoing a
+            // repost needs X's retweet id, which the timeline item does not carry, so an already-
+            // reposted card opens X's repost screen (repost, quote and undo) instead.
+            ToggleState repostState = new ToggleState(e.reposted, e.reposts);
+            LinearLayout repost = (LinearLayout) iconButton(context, "Repost", muted, null, "\u21BB", "ic_vector_retweet_stroke");
+            Runnable paintRepost = () -> fillButton(repost, repostState.active ? "Undo repost" : "Repost",
+                    repostState.active ? REPOST_COLOR : muted, repostState.count, "\u21BB",
+                    repostState.active ? "ic_vector_retweet" : "ic_vector_retweet_stroke", "ic_vector_retweet");
+            paintRepost.run();
+            repost.setOnClickListener(view -> {
+                if (!repostState.active && runAction(card, PostAction.REPOST)) {
+                    repostState.toggle();
+                    paintRepost.run();
+                } else {
+                    // Already reposted, service not ready, or not a plain post: X's repost screen.
+                    openInX(context, card.intentLink("retweet", "tweet_id"));
+                }
+            });
 
-            // Like and bookmark go through X's own screens; when X sends the post again with the
-            // new state, the card redraws with it.
+            // Like, repost and bookmark run through X's own service in one tap; when X re-emits the
+            // post with the new state, the card redraws with it.
             ToggleState likeState = new ToggleState(e.liked, e.likes);
             LinearLayout like = (LinearLayout) iconButton(context, "Like", muted, null, "\u2661", "ic_vector_heart_stroke");
             Runnable paintLike = () -> fillButton(like, likeState.active ? "Unlike" : "Like",
@@ -753,9 +848,19 @@ public final class MagazineFeed {
                     likeState.active ? "\u2665" : "\u2661",
                     likeState.active ? "ic_vector_heart" : "ic_vector_heart_stroke", "ic_vector_heart");
             paintLike.run();
-            // The post screen's own heart likes and unlikes in one tap; X's like link would ask
-            // for confirmation every time.
-            like.setOnClickListener(view -> openInX(context, card.postLink()));
+            // One tap likes/unlikes through X's own service and updates the heart at once; X then
+            // re-emits the post and the card redraws with the real count. If that is not possible,
+            // the post screen's own heart likes and unlikes in one tap (X's like link would ask for
+            // confirmation every time and cannot unlike).
+            like.setOnClickListener(view -> {
+                boolean liking = !likeState.active;
+                if (runAction(card, liking ? PostAction.LIKE : PostAction.UNLIKE)) {
+                    likeState.toggle();
+                    paintLike.run();
+                } else {
+                    openInX(context, card.postLink());
+                }
+            });
 
             ToggleState bookmarkState = new ToggleState(e.bookmarked, null);
             LinearLayout bookmark = (LinearLayout) iconButton(context, "Bookmark", muted, null, "\u2606", "ic_vector_bookmark_stroke");
@@ -765,9 +870,16 @@ public final class MagazineFeed {
                     bookmarkState.active ? "ic_vector_bookmark" : "ic_vector_bookmark_stroke", "ic_vector_bookmark");
             paintBookmark.run();
             bookmark.setOnClickListener(view -> {
-                // X has no bookmark link; its own bookmark button is on the post screen.
-                Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
-                openInX(context, card.postLink());
+                boolean adding = !bookmarkState.active;
+                if (runAction(card, adding ? PostAction.BOOKMARK : PostAction.UNBOOKMARK)) {
+                    bookmarkState.toggle();
+                    paintBookmark.run();
+                    Toast.makeText(context, adding ? "Bookmarked" : "Removed from bookmarks", Toast.LENGTH_SHORT).show();
+                } else {
+                    // X has no bookmark link; its own bookmark button is on the post screen.
+                    Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
+                    openInX(context, card.postLink());
+                }
             });
             View share = iconButton(context, "Share", muted, null, "\u2197",
                     "ic_vector_share_android", "ic_vector_share");
@@ -1893,6 +2005,9 @@ public final class MagazineFeed {
         final boolean sensitiveMedia;
         final String coverText;
         final Engagement engagement;
+        // The live timeline item this card was read from, set by extract(). One-tap actions pass it
+        // to X's post-actions service through the patch bridges; null-safe (actions fall back).
+        Object item;
 
         private PostCard(String postId, String name, String handle, String avatarUrl, String text,
                          List<MediaItem> media, String repostedBy, String replyingTo,
@@ -1954,7 +2069,10 @@ public final class MagazineFeed {
                 if (item == null) continue;
                 try {
                     PostCard card = read(item.toString());
-                    if (card != null) cards.add(card);
+                    if (card != null) {
+                        card.item = item;
+                        cards.add(card);
+                    }
                 } catch (RuntimeException e) {
                     NewXLogger.printException(() -> LOG_PREFIX + "could not read a timeline item", e);
                 }
