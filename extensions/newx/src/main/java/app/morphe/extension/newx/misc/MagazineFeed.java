@@ -1086,7 +1086,13 @@ public final class MagazineFeed {
                     // X's photo viewer counts media positions from 1; videos open the player.
                     String path = item.video ? "video/1" : "photo/" + (index + 1);
                     // On the timeline media pops the card out; in the focus view it opens X's viewer.
-                    row.addTile(context, item, popOut != null ? popOut : view -> openInX(context, source.mediaLink(path)));
+                    View.OnClickListener open = view -> openInX(context, source.mediaLink(path));
+                    if (popOut == null && item.videoUrl != null) {
+                        // Focus view: the video plays right here; X's player stays one tap away.
+                        row.addVideoTile(context, item, open);
+                    } else {
+                        row.addTile(context, item, popOut != null ? popOut : open);
+                    }
                 }
                 LinearLayout.LayoutParams params = matchWidth();
                 if (r > 0) params.topMargin = gap;
@@ -1206,6 +1212,19 @@ public final class MagazineFeed {
             });
         }
 
+        void addVideoTile(Context context, MediaItem item, View.OnClickListener openInPlayer) {
+            int index = getChildCount();
+            aspects.add(shownAspect(item.aspect > 0 ? item.aspect : UNKNOWN_ASPECT));
+            VideoTile tile = new VideoTile(context, item, openInPlayer, (width, height) -> {
+                float shown = shownAspect(width / (float) height);
+                if (Math.abs(shown - aspects.get(index)) > 0.01f) {
+                    aspects.set(index, shown);
+                    requestLayout();
+                }
+            });
+            addView(tile);
+        }
+
         @Override
         protected void onMeasure(int widthSpec, int heightSpec) {
             int width = MeasureSpec.getSize(widthSpec);
@@ -1263,6 +1282,223 @@ public final class MagazineFeed {
             } catch (RuntimeException ignored) {
                 return url;
             }
+        }
+    }
+
+    // ---------- Inline video (focus view) ----------
+
+    private interface VideoSizeListener {
+        void onSize(int width, int height);
+    }
+
+    /**
+     * Plays a post's mp4 inside the enlarged card: muted autoplay like X, tap to pause or resume,
+     * a sound toggle, and a button for X's own full-screen player. GIFs loop silently. The
+     * preview frame shows until the first video frame renders. Released when the card closes.
+     */
+    private static final class VideoTile extends FrameLayout implements android.view.TextureView.SurfaceTextureListener {
+        private final MediaItem item;
+        private final VideoSizeListener sizeListener;
+        private final android.view.TextureView texture;
+        private final ImageView poster;
+        private final TextView playBadge;
+        private final TextView sound;
+        private android.media.MediaPlayer player;
+        private android.view.Surface surface;
+        private boolean muted = true;
+        private int videoWidth;
+        private int videoHeight;
+
+        VideoTile(Context context, MediaItem item, View.OnClickListener openInPlayer, VideoSizeListener sizeListener) {
+            super(context);
+            this.item = item;
+            this.sizeListener = sizeListener;
+            setBackgroundColor(Color.BLACK);
+            setContentDescription(item.gif ? "GIF" : "Video, tap to pause or play");
+
+            texture = new android.view.TextureView(context);
+            texture.setSurfaceTextureListener(this);
+            addView(texture, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+            poster = new ImageView(context);
+            poster.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            addView(poster, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            CardImageLoader.load(MediaRow.mediumUrl(item.url), new CardImageLoader.Callback() {
+                @Override
+                public void onLoaded(Bitmap bitmap) {
+                    if (!bitmap.isRecycled()) poster.setImageBitmap(bitmap);
+                }
+
+                @Override
+                public void onFailed(boolean transientError) {
+                }
+            });
+
+            playBadge = overlayButton(context, "\u25B6", 48f);
+            playBadge.setVisibility(View.GONE);
+            playBadge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            addView(playBadge, new FrameLayout.LayoutParams(
+                    Theme.dpToPx(context, 48f), Theme.dpToPx(context, 48f), Gravity.CENTER));
+
+            int small = Theme.dpToPx(context, 36f);
+            int inset = Theme.dpToPx(context, 8f);
+            sound = overlayButton(context, "\uD83D\uDD07", 36f);
+            sound.setContentDescription("Turn sound on");
+            sound.setOnClickListener(view -> toggleSound());
+            FrameLayout.LayoutParams soundParams = new FrameLayout.LayoutParams(small, small, Gravity.BOTTOM | Gravity.END);
+            soundParams.setMargins(inset, inset, inset, inset);
+            if (!item.gif) addView(sound, soundParams);
+
+            TextView expand = overlayButton(context, "\u2922", 36f);
+            expand.setContentDescription("Open in X's player");
+            expand.setOnClickListener(openInPlayer);
+            FrameLayout.LayoutParams expandParams = new FrameLayout.LayoutParams(small, small, Gravity.TOP | Gravity.END);
+            expandParams.setMargins(inset, inset, inset, inset);
+            addView(expand, expandParams);
+
+            setClickable(true);
+            setOnClickListener(view -> togglePlay());
+        }
+
+        private static TextView overlayButton(Context context, String glyph, float sizeDp) {
+            TextView button = new TextView(context);
+            button.setText(glyph);
+            button.setTextSize(sizeDp * 0.4f);
+            button.setTextColor(Color.WHITE);
+            button.setGravity(Gravity.CENTER);
+            GradientDrawable circle = new GradientDrawable();
+            circle.setShape(GradientDrawable.OVAL);
+            circle.setColor(0x8C000000);
+            button.setBackground(circle);
+            return button;
+        }
+
+        @Override
+        public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture texture, int width, int height) {
+            surface = new android.view.Surface(texture);
+            start();
+        }
+
+        @Override
+        public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture texture, int width, int height) {
+            fitVideo();
+        }
+
+        @Override
+        public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture texture) {
+            release();
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture texture) {
+        }
+
+        private void start() {
+            release();
+            try {
+                android.media.MediaPlayer mediaPlayer = new android.media.MediaPlayer();
+                player = mediaPlayer;
+                mediaPlayer.setAudioAttributes(new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build());
+                mediaPlayer.setDataSource(item.videoUrl);
+                mediaPlayer.setSurface(surface);
+                mediaPlayer.setLooping(item.gif);
+                mediaPlayer.setVolume(0f, 0f);
+                mediaPlayer.setOnPreparedListener(mp -> {
+                    if (player == mp) mp.start();
+                });
+                mediaPlayer.setOnInfoListener((mp, what, extra) -> {
+                    if (what == android.media.MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) poster.setVisibility(View.GONE);
+                    return false;
+                });
+                mediaPlayer.setOnVideoSizeChangedListener((mp, width, height) -> {
+                    if (width <= 0 || height <= 0) return;
+                    videoWidth = width;
+                    videoHeight = height;
+                    sizeListener.onSize(width, height);
+                    fitVideo();
+                });
+                mediaPlayer.setOnCompletionListener(mp -> playBadge.setVisibility(View.VISIBLE));
+                mediaPlayer.setOnErrorListener((mp, what, extra) -> {
+                    log("inline video failed what=" + what + " extra=" + extra);
+                    poster.setVisibility(View.VISIBLE);
+                    playBadge.setVisibility(View.VISIBLE);
+                    return true;
+                });
+                mediaPlayer.prepareAsync();
+            } catch (java.io.IOException | RuntimeException e) {
+                NewXLogger.printException(() -> LOG_PREFIX + "inline video could not start", e);
+                playBadge.setVisibility(View.VISIBLE);
+            }
+        }
+
+        private void togglePlay() {
+            android.media.MediaPlayer mediaPlayer = player;
+            if (mediaPlayer == null) {
+                if (surface != null) start();
+                return;
+            }
+            try {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                    playBadge.setVisibility(View.VISIBLE);
+                } else {
+                    mediaPlayer.start();
+                    playBadge.setVisibility(View.GONE);
+                }
+            } catch (IllegalStateException e) {
+                // Still preparing; it starts on its own when ready.
+            }
+        }
+
+        private void toggleSound() {
+            muted = !muted;
+            sound.setText(muted ? "\uD83D\uDD07" : "\uD83D\uDD0A");
+            sound.setContentDescription(muted ? "Turn sound on" : "Mute");
+            if (player != null) {
+                try {
+                    player.setVolume(muted ? 0f : 1f, muted ? 0f : 1f);
+                } catch (IllegalStateException ignored) {
+                }
+            }
+        }
+
+        /** Shows the whole frame (letterboxed) when the tile's shape was clamped. */
+        private void fitVideo() {
+            int viewWidth = texture.getWidth();
+            int viewHeight = texture.getHeight();
+            if (viewWidth == 0 || viewHeight == 0 || videoWidth == 0 || videoHeight == 0) return;
+            float scale = Math.min(viewWidth / (float) videoWidth, viewHeight / (float) videoHeight);
+            android.graphics.Matrix matrix = new android.graphics.Matrix();
+            matrix.setScale(videoWidth * scale / viewWidth, videoHeight * scale / viewHeight,
+                    viewWidth / 2f, viewHeight / 2f);
+            texture.setTransform(matrix);
+        }
+
+        private void release() {
+            android.media.MediaPlayer mediaPlayer = player;
+            player = null;
+            if (mediaPlayer != null) {
+                try {
+                    mediaPlayer.release();
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            release();
+            if (surface != null) {
+                surface.release();
+                surface = null;
+            }
+            super.onDetachedFromWindow();
         }
     }
 
@@ -1463,13 +1699,17 @@ public final class MagazineFeed {
     }
 
     private static final class MediaItem {
-        final String url;
+        final String url;          // still image: the photo, or a video's preview frame
         final boolean video;
-        final float aspect; // width / height from the model, or 0 when unknown
+        final boolean gif;
+        final String videoUrl;     // playable mp4 for videos and GIFs, or null
+        final float aspect;        // width / height from the model, or 0 when unknown
 
-        MediaItem(String url, boolean video, float aspect) {
+        MediaItem(String url, boolean video, boolean gif, String videoUrl, float aspect) {
             this.url = url;
             this.video = video;
+            this.gif = gif;
+            this.videoUrl = videoUrl;
             this.aspect = aspect;
         }
     }
@@ -1786,9 +2026,50 @@ public final class MagazineFeed {
                 String url = ToStringParser.fieldValue(segment, gif ? "previewUrl" : "imageUrl");
                 if (!NewXUtils.isHttpUrl(url)) url = ToStringParser.fieldValue(segment, "imageUrl");
                 if (!NewXUtils.isHttpUrl(url)) continue;
-                items.add(new MediaItem(url, video, aspectOf(segment)));
+                items.add(new MediaItem(url, video, gif, video ? playableMp4(segment) : null, aspectOf(segment)));
             }
             return items;
+        }
+
+        /**
+         * The mp4 to play inline: MediaVariant(url=, bitRate=, contentType=video/mp4) entries,
+         * read the way InlineDownloadButton reads them. X puts each variant's size in its URL
+         * (/1280x720/); the largest up to 1280px wide is sharp in a card without wasting data.
+         */
+        private static String playableMp4(String segment) {
+            String prefix = "MediaVariant(url=";
+            String best = null;
+            int bestWidth = -1;
+            String fallback = null;
+            long fallbackBitRate = -1;
+            int offset = 0;
+            while (true) {
+                int start = segment.indexOf(prefix, offset);
+                if (start < 0) break;
+                start += prefix.length();
+                int bitRateStart = segment.indexOf(", bitRate=", start);
+                int contentTypeStart = bitRateStart < 0 ? -1 : segment.indexOf(", contentType=", bitRateStart);
+                int end = contentTypeStart < 0 ? -1 : segment.indexOf(')', contentTypeStart);
+                if (end < 0) break;
+                offset = end + 1;
+                String url = segment.substring(start, bitRateStart).trim();
+                String contentType = segment.substring(contentTypeStart + ", contentType=".length(), end).trim();
+                if (!InlineDownloadButton.isHttpMp4Variant(url, contentType)) continue;
+                long bitRate = (long) number(segment.substring(bitRateStart + ", bitRate=".length(), contentTypeStart));
+                java.util.regex.Matcher size = java.util.regex.Pattern.compile("/(\\d{2,5})x(\\d{2,5})/").matcher(url);
+                if (size.find()) {
+                    int width = Integer.parseInt(size.group(1));
+                    if (width <= 1280 && width > bestWidth) {
+                        best = url;
+                        bestWidth = width;
+                    }
+                }
+                if (bitRate > fallbackBitRate) {
+                    fallback = url;
+                    fallbackBitRate = bitRate;
+                }
+            }
+            return best != null ? best : fallback;
         }
 
         private static int nextMedia(String list, int offset) {
