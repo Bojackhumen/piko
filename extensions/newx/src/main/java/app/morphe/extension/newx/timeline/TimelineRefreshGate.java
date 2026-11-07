@@ -19,8 +19,15 @@ public final class TimelineRefreshGate {
     private TimelineRefreshGate() {
     }
 
+    /**
+     * Extra on in-app links that Piko 2.0 cards open. Such a link is navigation inside the app,
+     * not a post arriving from outside, so it must not let the home timeline refresh.
+     */
+    public static final String INTERNAL_NAVIGATION_EXTRA = "piko.internal_navigation";
+
     public static void markPostDeepLink(Intent intent) {
         if (!isPostDeepLink(intent)) return;
+        if (intent.getBooleanExtra(INTERNAL_NAVIGATION_EXTRA, false)) return;
 
         pendingPostDeepLinkDeadline.set(
                 SystemClock.uptimeMillis() + PENDING_REFRESH_TIMEOUT_MILLIS

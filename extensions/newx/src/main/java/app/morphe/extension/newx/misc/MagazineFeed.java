@@ -199,6 +199,9 @@ public final class MagazineFeed {
         if (url == null) return;
         Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
         intent.setPackage(context.getPackageName());
+        // In-app navigation, not an outside post link: Piko's refresh gate must not let this
+        // refresh the home timeline (it would with "Disable automatic timeline refresh" on).
+        intent.putExtra(app.morphe.extension.newx.timeline.TimelineRefreshGate.INTERNAL_NAVIGATION_EXTRA, true);
         if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             context.startActivity(intent);
@@ -241,8 +244,15 @@ public final class MagazineFeed {
         // One id per process so recreated AndroidView instances share saved scroll state.
         private static final int VIEW_STATE_ID = View.generateViewId();
 
+        // Where the reader was, kept across view recreation (leaving for a post and coming back
+        // can rebuild the AndroidView) and across X re-sending the timeline: the post at the top
+        // of the screen and how far it was scrolled past.
+        private static String anchorPostId;
+        private static int anchorOffset;
+
         private final MasonryGrid grid;
         private final LoadingIndicatorView loadingIndicator;
+        private boolean restorePending;
         private Object callback;
         private int currentItemCount = -1;
         private boolean loadMoreInFlight;
@@ -261,6 +271,7 @@ public final class MagazineFeed {
             setClipToPadding(false);
             setVerticalScrollBarEnabled(false);
             setOnScrollChangeListener((View.OnScrollChangeListener) (view, x, y, oldX, oldY) -> {
+                if (!restorePending) rememberAnchor();
                 if (y <= oldY || loadMoreInFlight) return;
                 paginationArmed = true;
                 checkLoadMore();
@@ -287,7 +298,50 @@ public final class MagazineFeed {
 
             addView(content, new NestedScrollView.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            restorePending = anchorPostId != null;
             setItems(items);
+        }
+
+        private void rememberAnchor() {
+            int top = getScrollY();
+            int bestIndex = -1;
+            int bestTop = Integer.MIN_VALUE;
+            // The card whose top is closest above the screen's top edge, in any column.
+            for (int i = 0; i < grid.getChildCount(); i++) {
+                int cardTop = grid.getTop() + grid.getChildAt(i).getTop();
+                if (cardTop <= top + 1 && cardTop > bestTop) {
+                    bestTop = cardTop;
+                    bestIndex = i;
+                }
+            }
+            if (bestIndex < 0) {
+                if (top == 0) anchorPostId = null;
+                return;
+            }
+            anchorPostId = grid.postIdAt(bestIndex);
+            anchorOffset = top - bestTop;
+        }
+
+        /** After the cards are laid out, puts the remembered post back at the top of the screen. */
+        private void restoreAnchorAfterLayout() {
+            if (anchorPostId == null) {
+                restorePending = false;
+                return;
+            }
+            restorePending = true;
+            getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                @Override
+                public void onGlobalLayout() {
+                    getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                    int index = grid.indexOfPost(anchorPostId);
+                    if (index >= 0) {
+                        int target = grid.getTop() + grid.getChildAt(index).getTop() + anchorOffset;
+                        scrollTo(0, Math.max(0, target));
+                        log("restored position at post " + anchorPostId);
+                    }
+                    restorePending = false;
+                }
+            });
         }
 
         void update(List<?> items, Object callback, float topPaddingDp) {
@@ -306,7 +360,9 @@ public final class MagazineFeed {
         private void setItems(List<?> items) {
             List<?> next = items == null ? Collections.emptyList() : items;
             List<PostCard> cards = PostCard.extract(next);
-            grid.setCards(cards);
+            boolean rebuilt = grid.setCards(cards);
+            // A new view, or X replacing the timeline (a refresh): keep the reader on their post.
+            if (restorePending || rebuilt) restoreAnchorAfterLayout();
             if (currentItemCount != next.size()) {
                 int previous = currentItemCount;
                 log("items=" + next.size() + " cards=" + cards.size() + " previous=" + previous);
@@ -380,7 +436,18 @@ public final class MagazineFeed {
             setWillNotDraw(true);
         }
 
-        void setCards(List<PostCard> next) {
+        String postIdAt(int index) {
+            return index >= 0 && index < cards.size() ? cards.get(index).postId : null;
+        }
+
+        int indexOfPost(String postId) {
+            if (postId == null) return -1;
+            for (int i = 0; i < cards.size(); i++) if (postId.equals(cards.get(i).postId)) return i;
+            return -1;
+        }
+
+        /** Returns true when the cards were rebuilt rather than appended to. */
+        boolean setCards(List<PostCard> next) {
             boolean appendOnly = next.size() >= cards.size()
                     && next.subList(0, cards.size()).equals(cards);
             if (!appendOnly) {
@@ -402,7 +469,9 @@ public final class MagazineFeed {
                 }
             }
             requestLayout();
+            boolean rebuilt = !appendOnly && !cards.isEmpty();
             cards = next;
+            return rebuilt;
         }
 
         private int columnCount(int width) {
