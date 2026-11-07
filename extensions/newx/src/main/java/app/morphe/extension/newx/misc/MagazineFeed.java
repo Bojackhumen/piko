@@ -1202,28 +1202,48 @@ public final class MagazineFeed {
 
     /**
      * Plays a post's mp4 inside the enlarged card: muted autoplay like X, tap to pause or resume,
-     * a sound toggle, and a button for X's own full-screen player. GIFs loop silently. The
-     * preview frame shows until the first video frame renders. Released when the card closes.
+     * double-tap the left or right half to rewind or jump, a draggable scrubber with elapsed and
+     * total time, a sound toggle, and a button for X's own full-screen player. GIFs loop silently
+     * with no controls. The preview frame shows until the first video frame renders. Released when
+     * the card closes.
      */
     private static final class VideoTile extends FrameLayout implements android.view.TextureView.SurfaceTextureListener {
+        private static final int SEEK_STEP_MS = 10_000;
+
         private final MediaItem item;
         private final VideoSizeListener sizeListener;
         private final android.view.TextureView texture;
         private final ImageView poster;
         private final TextView playBadge;
-        private final TextView sound;
+        private final TextView seekFeedback;
+        private final android.view.GestureDetector gestures;
+        private TextView sound;
+        private android.widget.SeekBar scrubber;
+        private TextView elapsedLabel;
+        private TextView totalLabel;
         private android.media.MediaPlayer player;
         private android.view.Surface surface;
         private boolean muted = true;
+        private boolean prepared;
+        private boolean tracking;
         private int videoWidth;
         private int videoHeight;
+
+        // Advances the scrubber and elapsed time ~twice a second while attached.
+        private final Runnable progressTick = new Runnable() {
+            @Override
+            public void run() {
+                updateProgress();
+                if (isAttachedToWindow()) postDelayed(this, 500);
+            }
+        };
 
         VideoTile(Context context, MediaItem item, View.OnClickListener openInPlayer, VideoSizeListener sizeListener) {
             super(context);
             this.item = item;
             this.sizeListener = sizeListener;
             setBackgroundColor(Color.BLACK);
-            setContentDescription(item.gif ? "GIF" : "Video, tap to pause or play");
+            setContentDescription(item.gif ? "GIF" : "Video, tap to pause, double-tap the sides to seek");
 
             texture = new android.view.TextureView(context);
             texture.setSurfaceTextureListener(this);
@@ -1245,6 +1265,92 @@ public final class MagazineFeed {
                 }
             });
 
+            int inset = Theme.dpToPx(context, 8f);
+
+            // The scrubber row, sound included, sits on a dark gradient at the bottom. GIFs are
+            // short silent loops, so they get no controls.
+            if (!item.gif) {
+                LinearLayout bar = new LinearLayout(context);
+                bar.setOrientation(LinearLayout.HORIZONTAL);
+                bar.setGravity(Gravity.CENTER_VERTICAL);
+                bar.setPadding(inset, inset / 2, inset / 2, inset / 2);
+                bar.setBackground(new GradientDrawable(
+                        GradientDrawable.Orientation.BOTTOM_TOP, new int[]{0xB3000000, 0x00000000}));
+
+                elapsedLabel = timeLabel(context, "0:00");
+                totalLabel = timeLabel(context, "0:00");
+
+                scrubber = new android.widget.SeekBar(context);
+                int accent = Theme.primaryAccent(context);
+                scrubber.setProgressTintList(ColorStateList.valueOf(accent));
+                scrubber.setThumbTintList(ColorStateList.valueOf(accent));
+                scrubber.setContentDescription("Video position");
+                scrubber.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+                    @Override
+                    public void onProgressChanged(android.widget.SeekBar sb, int progress, boolean fromUser) {
+                        if (fromUser) elapsedLabel.setText(formatTime(progress));
+                    }
+
+                    @Override
+                    public void onStartTrackingTouch(android.widget.SeekBar sb) {
+                        tracking = true;
+                    }
+
+                    @Override
+                    public void onStopTrackingTouch(android.widget.SeekBar sb) {
+                        tracking = false;
+                        android.media.MediaPlayer mediaPlayer = player;
+                        if (mediaPlayer != null && prepared) {
+                            try {
+                                mediaPlayer.seekTo(sb.getProgress());
+                            } catch (IllegalStateException ignored) {
+                            }
+                        }
+                    }
+                });
+
+                int gap = Theme.dpToPx(context, 6f);
+                LinearLayout.LayoutParams elapsedParams = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                LinearLayout.LayoutParams scrubberParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                scrubberParams.setMarginStart(gap);
+                scrubberParams.setMarginEnd(gap);
+                bar.addView(elapsedLabel, elapsedParams);
+                bar.addView(scrubber, scrubberParams);
+                bar.addView(totalLabel, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                int soundSize = Theme.dpToPx(context, 32f);
+                sound = overlayButton(context, "\uD83D\uDD07", 32f);
+                sound.setContentDescription("Turn sound on");
+                sound.setOnClickListener(view -> toggleSound());
+                LinearLayout.LayoutParams soundParams = new LinearLayout.LayoutParams(soundSize, soundSize);
+                soundParams.setMarginStart(gap);
+                bar.addView(sound, soundParams);
+
+                addView(bar, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+            }
+
+            // Brief "-10s" / "+10s" flash on a double-tap seek.
+            seekFeedback = new TextView(context);
+            seekFeedback.setTextColor(Color.WHITE);
+            seekFeedback.setTextSize(15f);
+            seekFeedback.setGravity(Gravity.CENTER);
+            int feedbackPadH = Theme.dpToPx(context, 14f);
+            int feedbackPadV = Theme.dpToPx(context, 8f);
+            seekFeedback.setPadding(feedbackPadH, feedbackPadV, feedbackPadH, feedbackPadV);
+            GradientDrawable feedbackBackground = new GradientDrawable();
+            feedbackBackground.setColor(0x8C000000);
+            feedbackBackground.setCornerRadius(Theme.dpToPx(context, 20f));
+            seekFeedback.setBackground(feedbackBackground);
+            seekFeedback.setVisibility(View.GONE);
+            seekFeedback.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            FrameLayout.LayoutParams feedbackParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+            feedbackParams.setMargins(Theme.dpToPx(context, 32f), 0, Theme.dpToPx(context, 32f), 0);
+            addView(seekFeedback, feedbackParams);
+
             playBadge = overlayButton(context, "\u25B6", 48f);
             playBadge.setVisibility(View.GONE);
             playBadge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
@@ -1252,14 +1358,6 @@ public final class MagazineFeed {
                     Theme.dpToPx(context, 48f), Theme.dpToPx(context, 48f), Gravity.CENTER));
 
             int small = Theme.dpToPx(context, 36f);
-            int inset = Theme.dpToPx(context, 8f);
-            sound = overlayButton(context, "\uD83D\uDD07", 36f);
-            sound.setContentDescription("Turn sound on");
-            sound.setOnClickListener(view -> toggleSound());
-            FrameLayout.LayoutParams soundParams = new FrameLayout.LayoutParams(small, small, Gravity.BOTTOM | Gravity.END);
-            soundParams.setMargins(inset, inset, inset, inset);
-            if (!item.gif) addView(sound, soundParams);
-
             TextView expand = overlayButton(context, "\u2922", 36f);
             expand.setContentDescription("Open in X's player");
             expand.setOnClickListener(openInPlayer);
@@ -1267,8 +1365,33 @@ public final class MagazineFeed {
             expandParams.setMargins(inset, inset, inset, inset);
             addView(expand, expandParams);
 
+            gestures = new android.view.GestureDetector(context, new android.view.GestureDetector.SimpleOnGestureListener() {
+                @Override
+                public boolean onDown(MotionEvent event) {
+                    return true;
+                }
+
+                @Override
+                public boolean onSingleTapConfirmed(MotionEvent event) {
+                    togglePlay();
+                    return true;
+                }
+
+                @Override
+                public boolean onDoubleTap(MotionEvent event) {
+                    if (!item.gif && prepared) {
+                        seekBy(event.getX() < getWidth() / 2f ? -SEEK_STEP_MS : SEEK_STEP_MS);
+                    }
+                    return true;
+                }
+            });
             setClickable(true);
-            setOnClickListener(view -> togglePlay());
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            gestures.onTouchEvent(event);
+            return true;
         }
 
         private static TextView overlayButton(Context context, String glyph, float sizeDp) {
@@ -1282,6 +1405,26 @@ public final class MagazineFeed {
             circle.setColor(0x8C000000);
             button.setBackground(circle);
             return button;
+        }
+
+        private static TextView timeLabel(Context context, String text) {
+            TextView label = new TextView(context);
+            label.setText(text);
+            label.setTextSize(11f);
+            label.setTextColor(Color.WHITE);
+            label.setIncludeFontPadding(false);
+            return label;
+        }
+
+        private static String formatTime(int milliseconds) {
+            int totalSeconds = Math.max(0, milliseconds) / 1000;
+            int seconds = totalSeconds % 60;
+            int minutes = (totalSeconds / 60) % 60;
+            int hours = totalSeconds / 3600;
+            if (hours > 0) {
+                return String.format(java.util.Locale.ROOT, "%d:%02d:%02d", hours, minutes, seconds);
+            }
+            return String.format(java.util.Locale.ROOT, "%d:%02d", minutes, seconds);
         }
 
         @Override
@@ -1307,6 +1450,7 @@ public final class MagazineFeed {
 
         private void start() {
             release();
+            prepared = false;
             try {
                 android.media.MediaPlayer mediaPlayer = new android.media.MediaPlayer();
                 player = mediaPlayer;
@@ -1319,7 +1463,18 @@ public final class MagazineFeed {
                 mediaPlayer.setLooping(item.gif);
                 mediaPlayer.setVolume(0f, 0f);
                 mediaPlayer.setOnPreparedListener(mp -> {
-                    if (player == mp) mp.start();
+                    if (player != mp) return;
+                    prepared = true;
+                    int duration = Math.max(0, mp.getDuration());
+                    if (scrubber != null) {
+                        scrubber.setMax(duration);
+                        scrubber.setEnabled(duration > 0);
+                    }
+                    if (totalLabel != null) totalLabel.setText(formatTime(duration));
+                    mp.start();
+                    playBadge.setVisibility(View.GONE);
+                    removeCallbacks(progressTick);
+                    post(progressTick);
                 });
                 mediaPlayer.setOnInfoListener((mp, what, extra) -> {
                     if (what == android.media.MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) poster.setVisibility(View.GONE);
@@ -1365,10 +1520,51 @@ public final class MagazineFeed {
             }
         }
 
+        private void seekBy(int deltaMilliseconds) {
+            android.media.MediaPlayer mediaPlayer = player;
+            if (mediaPlayer == null || !prepared) return;
+            try {
+                int duration = mediaPlayer.getDuration();
+                int limit = duration > 0 ? duration : Integer.MAX_VALUE;
+                int target = Math.max(0, Math.min(limit, mediaPlayer.getCurrentPosition() + deltaMilliseconds));
+                mediaPlayer.seekTo(target);
+                if (scrubber != null) scrubber.setProgress(target);
+                if (elapsedLabel != null) elapsedLabel.setText(formatTime(target));
+                boolean forward = deltaMilliseconds > 0;
+                showSeekFeedback((forward ? "+" : "\u2212") + (Math.abs(deltaMilliseconds) / 1000) + "s", forward);
+            } catch (IllegalStateException ignored) {
+            }
+        }
+
+        private void showSeekFeedback(String text, boolean forward) {
+            seekFeedback.setText(text);
+            FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) seekFeedback.getLayoutParams();
+            params.gravity = Gravity.CENTER_VERTICAL | (forward ? Gravity.END : Gravity.START);
+            seekFeedback.setLayoutParams(params);
+            seekFeedback.animate().cancel();
+            seekFeedback.setAlpha(1f);
+            seekFeedback.setVisibility(View.VISIBLE);
+            seekFeedback.animate().alpha(0f).setStartDelay(450).setDuration(250)
+                    .withEndAction(() -> seekFeedback.setVisibility(View.GONE)).start();
+        }
+
+        private void updateProgress() {
+            android.media.MediaPlayer mediaPlayer = player;
+            if (mediaPlayer == null || !prepared || tracking || scrubber == null) return;
+            try {
+                int position = mediaPlayer.getCurrentPosition();
+                scrubber.setProgress(position);
+                if (elapsedLabel != null) elapsedLabel.setText(formatTime(position));
+            } catch (IllegalStateException ignored) {
+            }
+        }
+
         private void toggleSound() {
             muted = !muted;
-            sound.setText(muted ? "\uD83D\uDD07" : "\uD83D\uDD0A");
-            sound.setContentDescription(muted ? "Turn sound on" : "Mute");
+            if (sound != null) {
+                sound.setText(muted ? "\uD83D\uDD07" : "\uD83D\uDD0A");
+                sound.setContentDescription(muted ? "Turn sound on" : "Mute");
+            }
             if (player != null) {
                 try {
                     player.setVolume(muted ? 0f : 1f, muted ? 0f : 1f);
@@ -1390,6 +1586,8 @@ public final class MagazineFeed {
         }
 
         private void release() {
+            removeCallbacks(progressTick);
+            prepared = false;
             android.media.MediaPlayer mediaPlayer = player;
             player = null;
             if (mediaPlayer != null) {
