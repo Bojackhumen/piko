@@ -117,6 +117,81 @@ public final class MagazineFeed {
         NewXLogger.printInfo(() -> LOG_PREFIX + message);
     }
 
+    // ---------- One-tap actions through X's own post-actions service ----------
+
+    // X's post-actions service, captured by the patch when X's DI creates it. Null until then.
+    private static volatile Object postActions;
+
+    /** Patch hook: called from X's post-actions service constructor with the new instance. */
+    public static void capturePostActions(Object service) {
+        if (postActions == null) log("post actions service ready");
+        postActions = service;
+    }
+
+    // Patch-time bridges (bodies replaced by the patch). Unpatched, they throw, and the cards fall
+    // back to X's in-app action links.
+    private static Object postResultOf(Object timelineItem) {
+        throw new IllegalStateException("Piko 2.0 postResultOf bridge was not patched");
+    }
+
+    private static Object repostedOf(Object contextualPost) {
+        throw new IllegalStateException("Piko 2.0 repostedOf bridge was not patched");
+    }
+
+    private static void likePost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 likePost bridge was not patched");
+    }
+
+    private static void unlikePost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 unlikePost bridge was not patched");
+    }
+
+    private static void bookmarkPost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 bookmarkPost bridge was not patched");
+    }
+
+    private static void unbookmarkPost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 unbookmarkPost bridge was not patched");
+    }
+
+    private enum PostAction { LIKE, UNLIKE, BOOKMARK, UNBOOKMARK }
+
+    /**
+     * Runs the action through X's own service, exactly as X's action bar does. False when that is
+     * not possible yet (service not created, not a plain post, bridge unpatched); callers then use
+     * the in-app link instead.
+     */
+    private static boolean runAction(PostCard card, PostAction action) {
+        Object service = postActions;
+        if (service == null) {
+            log("post actions service not ready; using the link for " + action);
+            return false;
+        }
+        try {
+            Object post = postResultOf(card.item);
+            if (post == null) return false;
+            if (card.repostedBy != null) {
+                // A repost card shows the original post; act on that one.
+                try {
+                    Object original = repostedOf(post);
+                    if (original != null) post = original;
+                } catch (RuntimeException ignored) {
+                }
+            }
+            switch (action) {
+                case LIKE -> likePost(service, post);
+                case UNLIKE -> unlikePost(service, post);
+                case BOOKMARK -> bookmarkPost(service, post);
+                case UNBOOKMARK -> unbookmarkPost(service, post);
+            }
+            log(action + " sent for " + card.postId);
+            return true;
+        } catch (Throwable t) {
+            NewXLogger.printException(() -> LOG_PREFIX + action + " failed; using the link", t);
+            return false;
+        }
+    }
+
     // ---------- Opening things in X ----------
 
     /** Opens an x.com link inside X itself; X's deep-link router picks the screen. */
@@ -545,25 +620,46 @@ public final class MagazineFeed {
             // X's repost screen offers repost, quote and undo.
             repost.setOnClickListener(view -> openInX(context, card.intentLink("retweet", "tweet_id")));
 
-            View like = iconButton(context, e.liked ? "Unlike" : "Like",
-                    e.liked ? LIKE_COLOR : muted, e.likes, e.liked ? "\u2665" : "\u2661",
-                    e.liked ? "ic_vector_heart" : "ic_vector_heart_stroke", "ic_vector_heart");
+            // Like and bookmark run through X's own service in one tap and update the button at
+            // once; X then sends the post again with the real numbers and the card redraws.
+            ToggleState likeState = new ToggleState(e.liked, e.likes);
+            LinearLayout like = (LinearLayout) iconButton(context, "Like", muted, null, "\u2661", "ic_vector_heart_stroke");
+            Runnable paintLike = () -> fillButton(like, likeState.active ? "Unlike" : "Like",
+                    likeState.active ? LIKE_COLOR : muted, likeState.count,
+                    likeState.active ? "\u2665" : "\u2661",
+                    likeState.active ? "ic_vector_heart" : "ic_vector_heart_stroke", "ic_vector_heart");
+            paintLike.run();
             like.setOnClickListener(view -> {
-                if (e.liked) {
+                boolean liking = !likeState.active;
+                if (runAction(card, liking ? PostAction.LIKE : PostAction.UNLIKE)) {
+                    likeState.toggle();
+                    paintLike.run();
+                } else if (liking) {
+                    openInX(context, card.intentLink("like", "tweet_id"));
+                } else {
                     // X's like link cannot undo; the post screen's heart can.
                     openInX(context, card.postLink());
-                } else {
-                    openInX(context, card.intentLink("like", "tweet_id"));
                 }
             });
 
-            View bookmark = iconButton(context, e.bookmarked ? "Remove bookmark" : "Bookmark",
-                    e.bookmarked ? accent : muted, null, e.bookmarked ? "\u2605" : "\u2606",
-                    e.bookmarked ? "ic_vector_bookmark" : "ic_vector_bookmark_stroke", "ic_vector_bookmark");
+            ToggleState bookmarkState = new ToggleState(e.bookmarked, null);
+            LinearLayout bookmark = (LinearLayout) iconButton(context, "Bookmark", muted, null, "\u2606", "ic_vector_bookmark_stroke");
+            Runnable paintBookmark = () -> fillButton(bookmark, bookmarkState.active ? "Remove bookmark" : "Bookmark",
+                    bookmarkState.active ? accent : muted, null,
+                    bookmarkState.active ? "\u2605" : "\u2606",
+                    bookmarkState.active ? "ic_vector_bookmark" : "ic_vector_bookmark_stroke", "ic_vector_bookmark");
+            paintBookmark.run();
             bookmark.setOnClickListener(view -> {
-                // X has no bookmark link; its own bookmark button is on the post screen.
-                Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
-                openInX(context, card.postLink());
+                boolean adding = !bookmarkState.active;
+                if (runAction(card, adding ? PostAction.BOOKMARK : PostAction.UNBOOKMARK)) {
+                    bookmarkState.toggle();
+                    paintBookmark.run();
+                    Toast.makeText(context, adding ? "Bookmarked" : "Removed from bookmarks", Toast.LENGTH_SHORT).show();
+                } else {
+                    // X has no bookmark link; its own bookmark button is on the post screen.
+                    Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
+                    openInX(context, card.postLink());
+                }
             });
             View share = iconButton(context, "Share", muted, null, "\u2197",
                     "ic_vector_share_android", "ic_vector_share");
@@ -590,14 +686,25 @@ public final class MagazineFeed {
             button.setGravity(Gravity.CENTER_VERTICAL);
             button.setMinimumWidth(size);
             button.setMinimumHeight(size);
-            String countText = formatCount(count);
-            button.setContentDescription(countText == null ? label : label + ", " + countText);
             button.setClickable(true);
             button.setFocusable(true);
             TypedValue ripple = new TypedValue();
             if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, ripple, true)) {
                 button.setBackgroundResource(ripple.resourceId);
             }
+            int horizontal = Theme.dpToPx(context, 6f);
+            button.setPadding(horizontal, 0, horizontal, 0);
+            fillButton(button, label, color, count, glyph, iconNames);
+            return button;
+        }
+
+        /** (Re)draws a button's icon and count; also used after a one-tap like or bookmark. */
+        private static void fillButton(LinearLayout button, String label, int color, Long count,
+                                       String glyph, String... iconNames) {
+            Context context = button.getContext();
+            button.removeAllViews();
+            String countText = formatCount(count);
+            button.setContentDescription(countText == null ? label : label + ", " + countText);
             Drawable icon = findIcon(context, iconNames);
             View inner;
             if (icon != null) {
@@ -621,9 +728,24 @@ public final class MagazineFeed {
                 params.leftMargin = Theme.dpToPx(context, 5f);
                 button.addView(counter, params);
             }
-            int horizontal = Theme.dpToPx(context, 6f);
-            button.setPadding(horizontal, 0, horizontal, 0);
-            return button;
+        }
+
+        /** A like or bookmark button's own state between X's updates. */
+        private static final class ToggleState {
+            boolean active;
+            Long count;
+
+            ToggleState(boolean active, Long count) {
+                this.active = active;
+                this.count = count;
+            }
+
+            void toggle() {
+                active = !active;
+                // A missing count means none yet: liking makes it 1, unliking the last one hides it.
+                long next = Math.max(0, (count == null ? 0 : count) + (active ? 1 : -1));
+                count = next == 0 ? null : next;
+            }
         }
 
         /** 999, 1.2K, 34K, 1.5M, as X abbreviates counts. */
@@ -1193,6 +1315,8 @@ public final class MagazineFeed {
         final boolean sensitiveMedia;
         final String coverText;
         final Engagement engagement;
+        // The timeline item the card was read from; the one-tap bridges take its post from it.
+        Object item;
 
         private PostCard(String postId, String name, String handle, String avatarUrl, String text,
                          List<MediaItem> media, String repostedBy, String replyingTo,
@@ -1254,7 +1378,10 @@ public final class MagazineFeed {
                 if (item == null) continue;
                 try {
                     PostCard card = read(item.toString());
-                    if (card != null) cards.add(card);
+                    if (card != null) {
+                        card.item = item;
+                        cards.add(card);
+                    }
                 } catch (RuntimeException e) {
                     NewXLogger.printException(() -> LOG_PREFIX + "could not read a timeline item", e);
                 }
