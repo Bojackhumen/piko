@@ -490,6 +490,20 @@ public final class MagazineFeed {
             setBackgroundColor(Color.TRANSPARENT);
             setClipToPadding(false);
             setVerticalScrollBarEnabled(false);
+            // A listener, not an onAttachedToWindow override: that method is final in X's
+            // NestedScrollView, and overriding it makes the class fail to load (LinkageError).
+            addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                @Override
+                public void onViewAttachedToWindow(View view) {
+                    liveViews.add(MagazineView.this);
+                }
+
+                @Override
+                public void onViewDetachedFromWindow(View view) {
+                    liveViews.remove(MagazineView.this);
+                    if (topAnimator != null) topAnimator.cancel();
+                }
+            });
             setOnScrollChangeListener((View.OnScrollChangeListener) (view, x, y, oldX, oldY) -> {
                 if (!restorePending) rememberAnchor();
                 if (y <= oldY || loadMoreInFlight) return;
@@ -564,19 +578,6 @@ public final class MagazineFeed {
             });
         }
 
-        // Public: NestedScrollView widens View's protected onAttachedToWindow.
-        @Override
-        public void onAttachedToWindow() {
-            super.onAttachedToWindow();
-            liveViews.add(this);
-        }
-
-        @Override
-        protected void onDetachedFromWindow() {
-            liveViews.remove(this);
-            super.onDetachedFromWindow();
-        }
-
         /**
          * Home re-selected (or the top bar tapped) while this feed is on screen, as on the native
          * list: scrolled down, glide back to the newest post; already at the top, ask X for newer
@@ -586,7 +587,7 @@ public final class MagazineFeed {
             anchorPostId = null;
             restorePending = false;
             if (getScrollY() > 0) {
-                smoothScrollTo(0, 0);
+                glideToTop();
                 return;
             }
             Object component = ProfilePhotosGallery.urtComponentOf(callback);
@@ -604,6 +605,21 @@ public final class MagazineFeed {
 
         void refreshCard(String postId) {
             grid.refreshCard(postId);
+        }
+
+        // X's bundled NestedScrollView is R8-optimized: methods X never calls (smoothScrollTo,
+        // among others) are renamed or gone, and some it does call are final. Only View's own
+        // API is used on it here (scrollTo), never NestedScrollView-only methods or overrides.
+        private android.animation.ValueAnimator topAnimator;
+
+        private void glideToTop() {
+            if (topAnimator != null) topAnimator.cancel();
+            int start = getScrollY();
+            topAnimator = android.animation.ValueAnimator.ofInt(start, 0);
+            topAnimator.setDuration(Math.min(450L, 180L + start / 20L));
+            topAnimator.setInterpolator(new android.view.animation.DecelerateInterpolator());
+            topAnimator.addUpdateListener(animation -> scrollTo(0, (Integer) animation.getAnimatedValue()));
+            topAnimator.start();
         }
 
         void update(List<?> items, Object callback, float topPaddingDp) {
