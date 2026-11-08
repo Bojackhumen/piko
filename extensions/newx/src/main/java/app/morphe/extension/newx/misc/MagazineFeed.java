@@ -468,6 +468,22 @@ public final class MagazineFeed {
             });
         }
 
+        /** After the cards are laid out, scrolls back to the top so a refresh shows the newest. */
+        private void scrollToTopAfterLayout() {
+            anchorPostId = null;
+            // Suppress anchor-remembering while we settle at the top.
+            restorePending = true;
+            getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                @Override
+                public void onGlobalLayout() {
+                    getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                    scrollTo(0, 0);
+                    anchorPostId = null;
+                    restorePending = false;
+                }
+            });
+        }
+
         void update(List<?> items, Object callback, float topPaddingDp) {
             this.callback = callback;
             applyTopPadding(topPaddingDp);
@@ -485,8 +501,16 @@ public final class MagazineFeed {
             List<?> next = items == null ? Collections.emptyList() : items;
             List<PostCard> cards = PostCard.extract(next);
             boolean rebuilt = grid.setCards(cards);
-            // A new view, or X replacing the timeline (a refresh): keep the reader on their post.
-            if (restorePending || rebuilt) restoreAnchorAfterLayout();
+            if (restorePending) {
+                // Coming back to a recreated view (left for a post and returned): keep the reader
+                // on the post they were on.
+                restoreAnchorAfterLayout();
+            } else if (rebuilt) {
+                // X replaced the timeline — tapping the home tab, pull-to-refresh, or switching
+                // For You / Following: show the newest posts from the top, like the native list,
+                // instead of holding the old scroll position.
+                scrollToTopAfterLayout();
+            }
             if (currentItemCount != next.size()) {
                 int previous = currentItemCount;
                 log("items=" + next.size() + " cards=" + cards.size() + " previous=" + previous);
@@ -580,12 +604,13 @@ public final class MagazineFeed {
                 columnOf.clear();
                 for (PostCard card : next) addView(CardViews.build(getContext(), card));
             } else {
-                // Same posts in the same places: redraw only cards whose counts or state changed,
-                // e.g. after liking a post X sends the post again with the new count.
+                // Same posts in the same places: refresh only cards whose counts or state changed,
+                // e.g. after liking a post X sends the post again with the new count. Update the
+                // action row in place instead of rebuilding the card, or the media reloads and the
+                // grid reflows and every post blinks on each like.
                 for (int i = 0; i < cards.size(); i++) {
                     if (!cards.get(i).engagement.sameAs(next.get(i).engagement)) {
-                        removeViewAt(i);
-                        addView(CardViews.build(getContext(), next.get(i)), i);
+                        CardViews.rebindEngagement(getChildAt(i), next.get(i));
                     }
                 }
                 for (int i = cards.size(); i < next.size(); i++) {
@@ -661,6 +686,27 @@ public final class MagazineFeed {
         private CardViews() {
         }
 
+        // Marks a card's action row so it can be found and refreshed in place (see rebindEngagement).
+        private static final Object ACTIONS_TAG = new Object();
+
+        /**
+         * Refreshes a built card's action row for new engagement without rebuilding the card, so the
+         * media is not reloaded and the masonry grid does not reflow. Used when X re-sends a post
+         * after a like/repost/bookmark; rebuilding the whole card made every post blink.
+         */
+        static void rebindEngagement(View cardRoot, PostCard card) {
+            if (cardRoot == null) return;
+            View actionRow = cardRoot.findViewWithTag(ACTIONS_TAG);
+            if (actionRow == null || !(actionRow.getParent() instanceof ViewGroup body)) return;
+            Context context = cardRoot.getContext();
+            int index = body.indexOfChild(actionRow);
+            body.removeViewAt(index);
+            body.addView(actions(context, card, Theme.secondaryText(context)), index);
+            cardRoot.setContentDescription(card.describe());
+            // Keep the card tap (focus view) pointed at the fresh card.
+            cardRoot.setOnClickListener(view -> showFocus(context, card));
+        }
+
         static View build(Context context, PostCard card) {
             return build(context, card, false);
         }
@@ -722,7 +768,17 @@ public final class MagazineFeed {
                     text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
                     text.setEllipsize(TextUtils.TruncateAt.END);
                 } else {
+                    // Keep the enlarged card within the screen; the full post is one tap away via
+                    // "Open full post". Budget the preview text by the viewport, leaving room for any
+                    // media and the card chrome so the focus overlay does not need to scroll.
                     text.setTextIsSelectable(true);
+                    android.util.DisplayMetrics metrics = context.getResources().getDisplayMetrics();
+                    int lineHeight = Math.max(1, Math.round(19f * 1.25f * metrics.scaledDensity));
+                    int reserved = Theme.dpToPx(context, 300f)
+                            + (card.media.isEmpty() ? 0 : Math.round(metrics.heightPixels * 0.42f));
+                    int maxLines = Math.max(4, (metrics.heightPixels - reserved) / lineHeight);
+                    text.setMaxLines(maxLines);
+                    text.setEllipsize(TextUtils.TruncateAt.END);
                 }
                 LinearLayout.LayoutParams params = matchWidth();
                 params.topMargin = Theme.dpToPx(context, 8f);
@@ -891,6 +947,7 @@ public final class MagazineFeed {
             }
             row.addView(bookmark);
             row.addView(share);
+            row.setTag(ACTIONS_TAG);
             return row;
         }
 
