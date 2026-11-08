@@ -483,6 +483,11 @@ public final class ProfilePhotosGallery {
         }
     }
 
+    /** The URT timeline component behind a timeline callback, or null (also used by Piko 2.0). */
+    static Object urtComponentOf(Object callback) {
+        return findUrtComponent(callback, getPagingEvent());
+    }
+
     private static Object findUrtComponent(Object callback, Object pagingEvent) {
         if (callback == null || pagingEvent == null) return null;
         Class<?> clazz = callback.getClass();

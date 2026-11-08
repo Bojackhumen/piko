@@ -5,6 +5,7 @@ import app.crimera.bytecode.fieldReference
 import app.crimera.bytecode.insertHook
 import app.crimera.bytecode.methodReference
 import app.crimera.patches.common.requireExactlyOne
+import app.crimera.patches.common.scopedMatchAll
 import app.crimera.patches.newx.misc.extension.newXExtensionPatch
 import app.crimera.patches.newx.models.newXInlineActionModelResolutionPatch
 import app.crimera.patches.newx.models.newXPostModelResolutionPatch
@@ -17,11 +18,16 @@ import app.crimera.patches.newx.settings.newXToggle
 import app.crimera.patches.newx.utils.Constants.COMPATIBILITY_NEW_X
 import app.crimera.patches.newx.utils.unsupportedOnMount
 import app.crimera.patches.settings.settingStrings
+import app.morphe.patcher.Fingerprint
+import app.morphe.patcher.InstructionLocation.MatchAfterImmediately
 import app.morphe.patcher.extensions.InstructionExtensions.instructions
 import app.morphe.patcher.extensions.InstructionExtensions.removeInstruction
+import app.morphe.patcher.methodCall
+import app.morphe.patcher.opcode
 import app.morphe.patcher.patch.BytecodePatchContext
 import app.morphe.patcher.patch.PatchException
 import app.morphe.patcher.patch.bytecodePatch
+import app.morphe.patcher.string
 import app.morphe.patcher.util.getReference
 import app.morphe.patcher.util.p0Register
 import app.morphe.patcher.util.registersUsed
@@ -30,6 +36,9 @@ import com.android.tools.smali.dexlib2.AccessFlags
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.Method
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 
 private const val MAGAZINE_EXTENSION = "Lapp/morphe/extension/newx/misc/MagazineFeed;"
@@ -37,6 +46,7 @@ private const val OBJECT = "Ljava/lang/Object;"
 private const val STRING = "Ljava/lang/String;"
 private const val MAP_BUILDER = "Lkotlin/collections/builders/MapBuilder;"
 private const val CAPTURE_DESCRIPTOR = "$MAGAZINE_EXTENSION->capturePostActions($OBJECT)V"
+private const val HOME_RESELECTED_DESCRIPTOR = "$MAGAZINE_EXTENSION->onHomeReselected()V"
 
 /**
  * One card action, as X's own 12.40.1 inline action bar issues it to the post-actions dispatcher.
@@ -44,9 +54,9 @@ private const val CAPTURE_DESCRIPTOR = "$MAGAZINE_EXTENSION->capturePostActions(
  * [mask] is the dispatcher's Kotlin default-argument mask: bit 3 (value 8) defaults the scribe map
  * to X's empty map, bit 4 (value 16) defaults the post id to null. X's create actions (like,
  * unlike, repost) pass a real, built scribe map and mask 16; its bookmark/unbookmark pass mask 24
- * (both defaulted). [realScribe] therefore builds the scribe map through X's own builder for the
- * mask-16 actions, and passes null for the mask-24 ones. Earlier Piko 2.0 builds sent mask 24 for
- * every action, so likes went down the empty-map path and never registered.
+ * (both defaulted) and its undo-repost mask 8. [realScribe] therefore builds the scribe map through
+ * X's own builder for the mask-16 actions, and passes null for the others. Earlier Piko 2.0 builds
+ * sent mask 24 for every action, so likes went down the empty-map path and never registered.
  */
 private data class CardAction(
     val bridge: String,
@@ -62,6 +72,9 @@ private val CARD_ACTIONS = listOf(
     CardAction("likePost", "Favorite", "LIKE", mask = 16, realScribe = true),
     CardAction("unlikePost", "Unfavorite", "UNLIKE", mask = 16, realScribe = true),
     CardAction("repostPost", "Retweet", "REPOST", mask = 16, realScribe = true),
+    // X's undo passes the retweet's own id only on the viewer's own retweet card; for the post
+    // itself it sends no id (mask 8: empty scribe map, the null id kept), which is this call.
+    CardAction("unrepostPost", "UndoRetweet", "UNREPOST", mask = 8, realScribe = false),
     CardAction("bookmarkPost", "AddToBookmarks", "BOOKMARK", mask = 24, realScribe = false),
     CardAction("unbookmarkPost", "RemoveFromBookmarks", "UNBOOKMARK", mask = 24, realScribe = false),
 )
@@ -253,6 +266,100 @@ private fun patchCardActions(actions: ResolvedPostActions) {
     }
 }
 
+// X's home scroll-to-top / refresh handler (the one Piko's refresh setting also guards): on the
+// home tabbed component, (ZZ)Z, reading the foreground auto-refresh timeout. It sends X's
+// timeline refresh and scroll-to-top events, which is how both events are identified below.
+private object MagazineHomeTopHandlerFingerprint : Fingerprint(
+    definingClass = "Lcom/x/home/tabbed/",
+    parameters = listOf("Z", "Z"),
+    returnType = "Z",
+    filters = listOf(
+        string("timeline_auto_refresh_on_foreground_timeout_millis"),
+        methodCall(
+            opcode = Opcode.INVOKE_INTERFACE,
+            name = "getInt",
+            parameters = listOf("Ljava/lang/String;", "I"),
+            returnType = "I",
+        ),
+        opcode(Opcode.MOVE_RESULT, MatchAfterImmediately()),
+    ),
+)
+
+/** One `timelineComponent.event(SINGLETON)` call: X's way of asking a URT timeline to act. */
+private data class UrtEventCall(val call: String, val callOwner: String, val event: String)
+
+private fun Method.urtEventCalls(): List<UrtEventCall> {
+    val instructions = implementation?.instructions?.toList() ?: return emptyList()
+    return instructions.mapIndexedNotNull { index, instruction ->
+        if (instruction.opcode != Opcode.INVOKE_INTERFACE) return@mapIndexedNotNull null
+        val call = instruction.getReference<MethodReference>() ?: return@mapIndexedNotNull null
+        if (call.returnType != "V" || call.parameterTypes.size != 1) return@mapIndexedNotNull null
+        val argument = (instruction as? FiveRegisterInstruction)?.registerD ?: return@mapIndexedNotNull null
+        // The event is a singleton object read just before the call.
+        val writer = (index - 1 downTo maxOf(0, index - 8))
+            .map { instructions[it] }
+            .firstOrNull { (it as? OneRegisterInstruction)?.registerA == argument }
+            ?: return@mapIndexedNotNull null
+        if (writer.opcode != Opcode.SGET_OBJECT) return@mapIndexedNotNull null
+        val event = writer.getReference<FieldReference>() ?: return@mapIndexedNotNull null
+        if (event.type != event.definingClass) return@mapIndexedNotNull null
+        UrtEventCall(
+            call = "${call.definingClass}->${call.name}(${call.parameterTypes.joinToString("")})${call.returnType}",
+            callOwner = call.definingClass,
+            event = "${event.definingClass}->${event.name}:${event.type}",
+        )
+    }
+}
+
+/**
+ * Home re-selected (or the top bar tapped) sends X's scroll-to-top event to the current home page's
+ * URT component, which only the native list listens to. With the card feed in its place, the
+ * request is forwarded to the feed at the start of that handler; and the feed's "already at the
+ * top" case refreshes through X's own refresh event, sent by [requestTimelineRefresh].
+ */
+context(context: BytecodePatchContext)
+private fun patchHomeReselect() {
+    val handler = requireExactlyOne(
+        "NewX home scroll-to-top/refresh handler",
+        MagazineHomeTopHandlerFingerprint.scopedMatchAll(),
+    ).method
+    val handlerEvents = handler.urtEventCalls().map { it.event }.toSet()
+    if (handlerEvents.isEmpty()) {
+        throw PatchException("NewX home handler ${handler.definingClass} sends no timeline event")
+    }
+
+    // The home component's no-argument method that sends exactly one timeline event, the same
+    // scroll-to-top event the back handler sends (Piko's own two-event refresh is not it).
+    val homeClass = context.mutableClassDefBy(handler.definingClass)
+    val scrollTopHandler = requireExactlyOne(
+        "NewX home scroll-to-top handler",
+        homeClass.methods.filter { method ->
+            method.returnType == "V" &&
+                method.parameterTypes.isEmpty() &&
+                !AccessFlags.STATIC.isSet(method.accessFlags) &&
+                method.name != "<init>" &&
+                method.urtEventCalls().let { calls -> calls.size == 1 && calls[0].event in handlerEvents }
+        },
+    )
+    val scrollTop = scrollTopHandler.urtEventCalls().single()
+    // X's own timeline refresh: the back handler's other event.
+    val refreshEvent = requireExactlyOne(
+        "NewX timeline refresh event",
+        handlerEvents.filter { it != scrollTop.event },
+    )
+
+    replaceBridge("requestTimelineRefresh", listOf(OBJECT), "V", totalRegisters = 3) { p0 ->
+        move(0, p0, OBJECT)
+        checkCast(0, scrollTop.callOwner)
+        sget(1, fieldReference(refreshEvent))
+        invokeInterface(methodReference(scrollTop.call), 0, 1)
+        returnVoid()
+    }
+    scrollTopHandler.insertHook(0, relocateBranchTargets = false) {
+        invokeStatic(methodReference(HOME_RESELECTED_DESCRIPTOR))
+    }
+}
+
 /**
  * Piko 2.0: the X Magazine userscript's card grid for the home timeline.
  *
@@ -300,6 +407,11 @@ val newXMagazineFeedPatch =
             runCatching { patchCardActions(resolvePostActions()) }
                 .onFailure { failure ->
                     System.err.println("NewX Piko 2.0: one-tap actions unavailable, cards use links: ${failure.message}")
+                }
+            // Also optional: without it, Home re-select simply does not move the card feed.
+            runCatching { patchHomeReselect() }
+                .onFailure { failure ->
+                    System.err.println("NewX Piko 2.0: Home re-select not forwarded to the cards: ${failure.message}")
                 }
         }
     }

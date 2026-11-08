@@ -150,6 +150,15 @@ public final class MagazineFeed {
         throw new IllegalStateException("Piko 2.0 repostPost bridge was not patched");
     }
 
+    private static void unrepostPost(Object service, Object post) {
+        throw new IllegalStateException("Piko 2.0 unrepostPost bridge was not patched");
+    }
+
+    /** Patch-time bridge: sends X's own timeline refresh event to the URT timeline component. */
+    private static void requestTimelineRefresh(Object urtComponent) {
+        throw new IllegalStateException("Piko 2.0 requestTimelineRefresh bridge was not patched");
+    }
+
     private static void bookmarkPost(Object service, Object post) {
         throw new IllegalStateException("Piko 2.0 bookmarkPost bridge was not patched");
     }
@@ -158,7 +167,7 @@ public final class MagazineFeed {
         throw new IllegalStateException("Piko 2.0 unbookmarkPost bridge was not patched");
     }
 
-    private enum PostAction { LIKE, UNLIKE, REPOST, BOOKMARK, UNBOOKMARK }
+    private enum PostAction { LIKE, UNLIKE, REPOST, UNREPOST, BOOKMARK, UNBOOKMARK }
 
     /**
      * Runs the action through X's own post-actions service, exactly as X's inline action bar does:
@@ -188,6 +197,7 @@ public final class MagazineFeed {
                 case LIKE -> likePost(service, post);
                 case UNLIKE -> unlikePost(service, post);
                 case REPOST -> repostPost(service, post);
+                case UNREPOST -> unrepostPost(service, post);
                 case BOOKMARK -> bookmarkPost(service, post);
                 case UNBOOKMARK -> unbookmarkPost(service, post);
             }
@@ -197,6 +207,90 @@ public final class MagazineFeed {
             NewXLogger.printException(() -> LOG_PREFIX + action + " failed; using the link", t);
             return false;
         }
+    }
+
+    // ---------- What the reader just did, until X confirms it ----------
+
+    // Optimistic engagement per post after a one-tap action. X re-sends the post a moment later
+    // with the real state; until then every view of the post (the grid card, its enlarged card, a
+    // rebuilt card) shows what the reader just did, so the views never disagree. Main thread only.
+    private static final java.util.Map<String, PendingEngagement> pendingEngagement = new java.util.HashMap<>();
+    // If X never confirms (the action failed, say), its own state wins again after this long.
+    private static final long PENDING_TTL_MS = 60_000L;
+
+    private static final class PendingEngagement {
+        final Engagement engagement;
+        final long at = android.os.SystemClock.uptimeMillis();
+
+        PendingEngagement(Engagement engagement) {
+            this.engagement = engagement;
+        }
+    }
+
+    /** The engagement to show for a card: the reader's pending action, else X's own. */
+    private static Engagement shownEngagement(PostCard card) {
+        PendingEngagement pending = card.postId == null ? null : pendingEngagement.get(card.postId);
+        if (pending == null) return card.engagement;
+        if (android.os.SystemClock.uptimeMillis() - pending.at > PENDING_TTL_MS) {
+            pendingEngagement.remove(card.postId);
+            return card.engagement;
+        }
+        return pending.engagement;
+    }
+
+    private static void rememberAction(PostCard card, Engagement next) {
+        if (card.postId != null) pendingEngagement.put(card.postId, new PendingEngagement(next));
+    }
+
+    /** Drops a pending action once X's own state for the post agrees with it (X's counts win). */
+    private static void reconcile(PostCard card) {
+        PendingEngagement pending = card.postId == null ? null : pendingEngagement.get(card.postId);
+        if (pending == null) return;
+        Engagement x = card.engagement;
+        Engagement mine = pending.engagement;
+        if (x.liked == mine.liked && x.reposted == mine.reposted && x.bookmarked == mine.bookmarked) {
+            pendingEngagement.remove(card.postId);
+        }
+    }
+
+    // ---------- Home re-select ----------
+
+    // Card feeds currently attached; X's pager can keep For You and Following alive together.
+    private static final java.util.Set<MagazineView> liveViews =
+            Collections.newSetFromMap(new java.util.WeakHashMap<>());
+
+    /**
+     * Patch hook, at the start of X's home scroll-to-top handler (Home tab re-selected, or the top
+     * bar tapped). X sends that request to the native list, which the card feed replaces, so the
+     * feed actually on screen handles it here. Switching to Home from another tab does not call it.
+     */
+    public static void onHomeReselected() {
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            MagazineView target = visibleFeed();
+            if (target != null) target.onReselected();
+        });
+    }
+
+    /** The attached feed showing the most of itself on screen (the current pager page). */
+    private static MagazineView visibleFeed() {
+        MagazineView best = null;
+        long bestArea = 0;
+        android.graphics.Rect rect = new android.graphics.Rect();
+        for (MagazineView view : new ArrayList<>(liveViews)) {
+            if (!view.isShown() || !view.getGlobalVisibleRect(rect)) continue;
+            long area = (long) rect.width() * rect.height();
+            if (area > bestArea) {
+                bestArea = area;
+                best = view;
+            }
+        }
+        return best;
+    }
+
+    /** After the focus view closes, shows on the grid card whatever the reader did in it. */
+    private static void refreshGridCard(String postId) {
+        if (postId == null) return;
+        for (MagazineView view : new ArrayList<>(liveViews)) view.refreshCard(postId);
     }
 
     // ---------- Opening things in X ----------
@@ -334,6 +428,8 @@ public final class MagazineFeed {
                 .setDuration(200).setInterpolator(new android.view.animation.DecelerateInterpolator()).start());
         dialog.setOnDismissListener(d -> {
             if (focusDialog == dialog) focusDialog = null;
+            // A like/repost/bookmark done in the enlarged card shows on the grid card at once.
+            refreshGridCard(card.postId);
         });
         focusDialog = dialog;
         dialog.show();
@@ -468,20 +564,45 @@ public final class MagazineFeed {
             });
         }
 
-        /** After the cards are laid out, scrolls back to the top so a refresh shows the newest. */
-        private void scrollToTopAfterLayout() {
+        @Override
+        protected void onAttachedToWindow() {
+            super.onAttachedToWindow();
+            liveViews.add(this);
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            liveViews.remove(this);
+            super.onDetachedFromWindow();
+        }
+
+        /**
+         * Home re-selected (or the top bar tapped) while this feed is on screen, as on the native
+         * list: scrolled down, glide back to the newest post; already at the top, ask X for newer
+         * posts. The refresh that follows lands at the top, since the anchor is cleared here.
+         */
+        void onReselected() {
             anchorPostId = null;
-            // Suppress anchor-remembering while we settle at the top.
-            restorePending = true;
-            getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
-                @Override
-                public void onGlobalLayout() {
-                    getViewTreeObserver().removeOnGlobalLayoutListener(this);
-                    scrollTo(0, 0);
-                    anchorPostId = null;
-                    restorePending = false;
-                }
-            });
+            restorePending = false;
+            if (getScrollY() > 0) {
+                smoothScrollTo(0, 0);
+                return;
+            }
+            Object component = ProfilePhotosGallery.urtComponentOf(callback);
+            if (component == null) {
+                log("home re-select: timeline component not found; no refresh");
+                return;
+            }
+            try {
+                requestTimelineRefresh(component);
+                log("home re-select: refresh requested");
+            } catch (Throwable t) {
+                NewXLogger.printException(() -> LOG_PREFIX + "home re-select refresh failed", t);
+            }
+        }
+
+        void refreshCard(String postId) {
+            grid.refreshCard(postId);
         }
 
         void update(List<?> items, Object callback, float topPaddingDp) {
@@ -501,16 +622,10 @@ public final class MagazineFeed {
             List<?> next = items == null ? Collections.emptyList() : items;
             List<PostCard> cards = PostCard.extract(next);
             boolean rebuilt = grid.setCards(cards);
-            if (restorePending) {
-                // Coming back to a recreated view (left for a post and returned): keep the reader
-                // on the post they were on.
-                restoreAnchorAfterLayout();
-            } else if (rebuilt) {
-                // X replaced the timeline — tapping the home tab, pull-to-refresh, or switching
-                // For You / Following: show the newest posts from the top, like the native list,
-                // instead of holding the old scroll position.
-                scrollToTopAfterLayout();
-            }
+            // A new view, or X replacing the timeline (a refresh): keep the reader on their post.
+            // Going to the top is an explicit request only (Home re-select, see onReselected), so
+            // coming back from a post never throws the reader to the top.
+            if (restorePending || rebuilt) restoreAnchorAfterLayout();
             if (currentItemCount != next.size()) {
                 int previous = currentItemCount;
                 log("items=" + next.size() + " cards=" + cards.size() + " previous=" + previous);
@@ -594,26 +709,39 @@ public final class MagazineFeed {
             return -1;
         }
 
+        /** Redraws one card's action row with what it should show now (see shownEngagement). */
+        void refreshCard(String postId) {
+            int index = indexOfPost(postId);
+            if (index >= 0 && index < getChildCount()) {
+                CardViews.rebindEngagement(getChildAt(index), cards.get(index));
+            }
+        }
+
         /** Returns true when the cards were rebuilt rather than appended to. */
         boolean setCards(List<PostCard> next) {
             boolean appendOnly = next.size() >= cards.size()
                     && next.subList(0, cards.size()).equals(cards);
             if (!appendOnly) {
                 // Refresh or reorder: rebuild, so positions follow the new order.
+                for (PostCard card : next) reconcile(card);
                 removeAllViews();
                 columnOf.clear();
                 for (PostCard card : next) addView(CardViews.build(getContext(), card));
             } else {
-                // Same posts in the same places: refresh only cards whose counts or state changed,
-                // e.g. after liking a post X sends the post again with the new count. Update the
-                // action row in place instead of rebuilding the card, or the media reloads and the
-                // grid reflows and every post blinks on each like.
+                // Same posts in the same places: refresh only cards whose shown counts or state
+                // changed, e.g. once X re-sends a post the reader just liked. Update the action
+                // row in place instead of rebuilding the card, or the media reloads, the grid
+                // reflows and every post blinks. A stale re-send (X has not applied the action
+                // yet) leaves the reader's pending state on screen rather than flipping it back.
                 for (int i = 0; i < cards.size(); i++) {
-                    if (!cards.get(i).engagement.sameAs(next.get(i).engagement)) {
+                    Engagement before = shownEngagement(cards.get(i));
+                    reconcile(next.get(i));
+                    if (!before.sameAs(shownEngagement(next.get(i)))) {
                         CardViews.rebindEngagement(getChildAt(i), next.get(i));
                     }
                 }
                 for (int i = cards.size(); i < next.size(); i++) {
+                    reconcile(next.get(i));
                     addView(CardViews.build(getContext(), next.get(i)));
                 }
             }
@@ -740,9 +868,11 @@ public final class MagazineFeed {
             }
 
             if (card.coverText == null && !card.media.isEmpty()) {
+                // In the enlarged card a tall image is capped so the card fits on screen.
                 root.addView(card.sensitiveMedia
                         ? sensitiveTile(context, card)
-                        : mediaBlock(context, card.media, card, popOut), matchWidth());
+                        : mediaBlock(context, card.media, card, popOut, focal ? focalMediaHeight(context) : 0),
+                        matchWidth());
             }
 
             LinearLayout body = new LinearLayout(context);
@@ -768,17 +898,33 @@ public final class MagazineFeed {
                     text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
                     text.setEllipsize(TextUtils.TruncateAt.END);
                 } else {
-                    // Keep the enlarged card within the screen; the full post is one tap away via
-                    // "Open full post". Budget the preview text by the viewport, leaving room for any
-                    // media and the card chrome so the focus overlay does not need to scroll.
-                    text.setTextIsSelectable(true);
+                    // Keep the enlarged card within the screen: budget the text by the viewport,
+                    // leaving room for the media (capped to the same share, see focalMediaHeight)
+                    // and the card chrome, so the focus overlay does not need to scroll.
                     android.util.DisplayMetrics metrics = context.getResources().getDisplayMetrics();
                     int lineHeight = Math.max(1, Math.round(19f * 1.25f * metrics.scaledDensity));
                     int reserved = Theme.dpToPx(context, 300f)
-                            + (card.media.isEmpty() ? 0 : Math.round(metrics.heightPixels * 0.42f));
+                            + (card.media.isEmpty() ? 0 : focalMediaHeight(context));
                     int maxLines = Math.max(4, (metrics.heightPixels - reserved) / lineHeight);
+                    text.setTextIsSelectable(true);
                     text.setMaxLines(maxLines);
-                    text.setEllipsize(TextUtils.TruncateAt.END);
+                    // Selectable text cannot show an ellipsis, so a post longer than the budget
+                    // turns into plain text ending in "…", and tapping it opens the full post.
+                    text.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                        @Override
+                        public void onLayoutChange(View v, int l, int t, int r, int b,
+                                                   int oldL, int oldT, int oldR, int oldB) {
+                            if (text.getLayout() == null) return;
+                            text.removeOnLayoutChangeListener(this);
+                            if (text.getLineCount() <= maxLines) return;
+                            text.post(() -> {
+                                text.setTextIsSelectable(false);
+                                text.setEllipsize(TextUtils.TruncateAt.END);
+                                text.setMaxLines(maxLines);
+                                text.setOnClickListener(view -> openInX(context, card.postLink()));
+                            });
+                        }
+                    });
                 }
                 LinearLayout.LayoutParams params = matchWidth();
                 params.topMargin = Theme.dpToPx(context, 8f);
@@ -859,6 +1005,38 @@ public final class MagazineFeed {
             menu.show();
         }
 
+        /**
+         * X's repost choices, as its own repost sheet offers them. Repost and undo run in place
+         * through X's service; quote opens X's composer with the post attached. If the service
+         * is not available, X's repost screen takes over.
+         */
+        private static void showRepostMenu(View anchor, PostCard card, ToggleState state, Runnable paint) {
+            Context context = anchor.getContext();
+            PopupMenu menu = new PopupMenu(context, anchor);
+            menu.getMenu().add(0, 1, 0, state.active ? "Undo repost" : "Repost");
+            menu.getMenu().add(0, 2, 1, "Quote");
+            menu.setOnMenuItemClickListener(item -> {
+                switch (item.getItemId()) {
+                    case 1 -> {
+                        boolean reposting = !state.active;
+                        if (runAction(card, reposting ? PostAction.REPOST : PostAction.UNREPOST)) {
+                            state.toggle();
+                            paint.run();
+                            rememberAction(card, shownEngagement(card).withReposted(state.active, state.count));
+                        } else {
+                            openInX(context, card.intentLink("retweet", "tweet_id"));
+                        }
+                    }
+                    case 2 -> openInX(context, card.quoteLink());
+                    default -> {
+                        return false;
+                    }
+                }
+                return true;
+            });
+            menu.show();
+        }
+
         private static final int LIKE_COLOR = 0xFFF91880;
         private static final int REPOST_COLOR = 0xFF00BA7C;
 
@@ -869,31 +1047,23 @@ public final class MagazineFeed {
             LinearLayout.LayoutParams rowParams = matchWidth();
             rowParams.topMargin = Theme.dpToPx(context, 6f);
             row.setLayoutParams(rowParams);
-            Engagement e = card.engagement;
+            // What the reader just did wins over a not-yet-updated post from X (see shownEngagement).
+            Engagement e = shownEngagement(card);
             int accent = Theme.primaryAccent(context);
 
             View reply = iconButton(context, "Reply", muted, e.replies, "\u21A9",
                     "ic_vector_reply_stroke", "ic_vector_reply");
             reply.setOnClickListener(view -> openInX(context, card.intentLink("post", "in_reply_to")));
 
-            // One tap reposts through X's own service and updates the button at once. Undoing a
-            // repost needs X's retweet id, which the timeline item does not carry, so an already-
-            // reposted card opens X's repost screen (repost, quote and undo) instead.
+            // Repost offers X's own choices (repost or quote; undo once reposted) instead of
+            // reposting publicly on a single tap. Repost and undo run in place, like like/bookmark.
             ToggleState repostState = new ToggleState(e.reposted, e.reposts);
             LinearLayout repost = (LinearLayout) iconButton(context, "Repost", muted, null, "\u21BB", "ic_vector_retweet_stroke");
             Runnable paintRepost = () -> fillButton(repost, repostState.active ? "Undo repost" : "Repost",
                     repostState.active ? REPOST_COLOR : muted, repostState.count, "\u21BB",
                     repostState.active ? "ic_vector_retweet" : "ic_vector_retweet_stroke", "ic_vector_retweet");
             paintRepost.run();
-            repost.setOnClickListener(view -> {
-                if (!repostState.active && runAction(card, PostAction.REPOST)) {
-                    repostState.toggle();
-                    paintRepost.run();
-                } else {
-                    // Already reposted, service not ready, or not a plain post: X's repost screen.
-                    openInX(context, card.intentLink("retweet", "tweet_id"));
-                }
-            });
+            repost.setOnClickListener(view -> showRepostMenu(view, card, repostState, paintRepost));
 
             // Like, repost and bookmark run through X's own service in one tap; when X re-emits the
             // post with the new state, the card redraws with it.
@@ -913,6 +1083,7 @@ public final class MagazineFeed {
                 if (runAction(card, liking ? PostAction.LIKE : PostAction.UNLIKE)) {
                     likeState.toggle();
                     paintLike.run();
+                    rememberAction(card, shownEngagement(card).withLiked(likeState.active, likeState.count));
                 } else {
                     openInX(context, card.postLink());
                 }
@@ -930,6 +1101,7 @@ public final class MagazineFeed {
                 if (runAction(card, adding ? PostAction.BOOKMARK : PostAction.UNBOOKMARK)) {
                     bookmarkState.toggle();
                     paintBookmark.run();
+                    rememberAction(card, shownEngagement(card).withBookmarked(bookmarkState.active));
                     Toast.makeText(context, adding ? "Bookmarked" : "Removed from bookmarks", Toast.LENGTH_SHORT).show();
                 } else {
                     // X has no bookmark link; its own bookmark button is on the post screen.
@@ -1138,12 +1310,25 @@ public final class MagazineFeed {
             return box;
         }
 
+        // Share of the screen height the enlarged card's media may take, so the card fits.
+        private static final float FOCAL_MEDIA_SHARE = 0.42f;
+
+        private static int focalMediaHeight(Context context) {
+            return Math.round(context.getResources().getDisplayMetrics().heightPixels * FOCAL_MEDIA_SHARE);
+        }
+
+        private static View mediaBlock(Context context, List<MediaItem> items, LinkSource source,
+                                       View.OnClickListener popOut) {
+            return mediaBlock(context, items, source, popOut, 0);
+        }
+
         /**
          * Up to four media tiles, as in the userscript: one row, or two rows of two for four
          * items. Each tile keeps its real shape; tiles in a row share one height.
+         * {@code maxHeight}: the whole block's height limit in px, or 0 for none.
          */
         private static View mediaBlock(Context context, List<MediaItem> items, LinkSource source,
-                                       View.OnClickListener popOut) {
+                                       View.OnClickListener popOut, int maxHeight) {
             List<MediaItem> shown = items.size() > MAX_MEDIA ? items.subList(0, MAX_MEDIA) : items;
             LinearLayout block = new LinearLayout(context);
             block.setOrientation(LinearLayout.VERTICAL);
@@ -1157,8 +1342,11 @@ public final class MagazineFeed {
                 for (int i = 0; i < shown.size(); i++) single.add(i);
                 rows.add(single);
             }
+            int rowMaxHeight = maxHeight > 0
+                    ? Math.max(1, (maxHeight - gap * (rows.size() - 1)) / rows.size()) : 0;
             for (int r = 0; r < rows.size(); r++) {
                 MediaRow row = new MediaRow(context, gap);
+                row.setMaxHeight(rowMaxHeight);
                 for (int index : rows.get(r)) {
                     MediaItem item = shown.get(index);
                     // X's photo viewer counts media positions from 1; videos open the player.
@@ -1230,10 +1418,17 @@ public final class MagazineFeed {
     private static final class MediaRow extends ViewGroup {
         private final int gap;
         private final List<Float> aspects = new ArrayList<>();
+        // 0 for none; when the natural height is taller, tiles shrink and the row is centered.
+        private int maxHeight;
+        private int leftOffset;
 
         MediaRow(Context context, int gap) {
             super(context);
             this.gap = gap;
+        }
+
+        void setMaxHeight(int maxHeight) {
+            this.maxHeight = Math.max(0, maxHeight);
         }
 
         void addTile(Context context, MediaItem item, View.OnClickListener click) {
@@ -1315,20 +1510,26 @@ public final class MagazineFeed {
             for (float aspect : aspects) sum += aspect;
             int available = Math.max(1, width - gap * (count - 1));
             int height = Math.max(1, Math.round(available / sum));
+            boolean capped = maxHeight > 0 && height > maxHeight;
+            if (capped) height = maxHeight;
             int used = 0;
             for (int i = 0; i < count; i++) {
-                int tileWidth = i == count - 1 ? available - used : Math.round(aspects.get(i) * height);
+                // Uncapped, the last tile takes the rounding remainder so the row fills the width.
+                int tileWidth = !capped && i == count - 1
+                        ? available - used : Math.round(aspects.get(i) * height);
+                tileWidth = Math.max(1, Math.min(tileWidth, available - used));
                 used += tileWidth;
                 getChildAt(i).measure(
-                        MeasureSpec.makeMeasureSpec(Math.max(1, tileWidth), MeasureSpec.EXACTLY),
+                        MeasureSpec.makeMeasureSpec(tileWidth, MeasureSpec.EXACTLY),
                         MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY));
             }
+            leftOffset = capped ? Math.max(0, (available - used) / 2) : 0;
             setMeasuredDimension(width, height);
         }
 
         @Override
         protected void onLayout(boolean changed, int l, int t, int r, int b) {
-            int left = 0;
+            int left = leftOffset;
             for (int i = 0; i < getChildCount(); i++) {
                 View child = getChildAt(i);
                 child.layout(left, 0, left + child.getMeasuredWidth(), child.getMeasuredHeight());
@@ -1988,6 +2189,18 @@ public final class MagazineFeed {
                     && Objects.equals(likes, other.likes) && Objects.equals(views, other.views);
         }
 
+        Engagement withLiked(boolean on, Long count) {
+            return new Engagement(replies, reposts, count, views, on, reposted, bookmarked);
+        }
+
+        Engagement withReposted(boolean on, Long count) {
+            return new Engagement(replies, count, likes, views, liked, on, bookmarked);
+        }
+
+        Engagement withBookmarked(boolean on) {
+            return new Engagement(replies, reposts, likes, views, liked, reposted, on);
+        }
+
         private static Long parseLong(String value) {
             if (value == null) return null;
             try {
@@ -2100,6 +2313,12 @@ public final class MagazineFeed {
         String intentLink(String action, String idParameter) {
             if (postId == null) return null;
             return "https://x.com/intent/" + action + "?" + idParameter + "=" + Uri.encode(postId);
+        }
+
+        /** X's composer with this post's link attached, which X shows as a quoted post. */
+        String quoteLink() {
+            String link = postLink();
+            return link == null ? null : "https://x.com/intent/post?url=" + Uri.encode(link);
         }
 
         String describe() {
