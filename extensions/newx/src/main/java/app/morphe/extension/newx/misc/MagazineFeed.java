@@ -2403,17 +2403,34 @@ public final class MagazineFeed {
 
         static List<PostCard> extract(List<?> items) {
             List<PostCard> cards = new ArrayList<>();
+            // X can hand the same post over more than once: as its own entry and inside a
+            // conversation module (a module becomes one card, for its first post: usually the
+            // thread's parent, which several modules can share), as a post and a repost of it,
+            // or again after a refresh kept the old rows. The native list shows threads as
+            // threads; the grid shows each post once, where X first placed it.
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            int repeated = 0;
+            int repeatedFromModules = 0;
             for (Object item : items) {
                 if (item == null) continue;
                 try {
-                    PostCard card = read(item.toString());
-                    if (card != null) {
-                        card.item = item;
-                        cards.add(card);
+                    String value = item.toString();
+                    PostCard card = read(value);
+                    if (card == null) continue;
+                    if (card.postId != null && !seen.add(card.postId)) {
+                        repeated++;
+                        if (value.startsWith("UrtTimelineModule(")) repeatedFromModules++;
+                        continue;
                     }
+                    card.item = item;
+                    cards.add(card);
                 } catch (RuntimeException e) {
                     NewXLogger.printException(() -> LOG_PREFIX + "could not read a timeline item", e);
                 }
+            }
+            if (repeated > 0) {
+                log("skipped " + repeated + " repeated posts (" + repeatedFromModules
+                        + " from modules) of " + items.size() + " items");
             }
             return cards;
         }
