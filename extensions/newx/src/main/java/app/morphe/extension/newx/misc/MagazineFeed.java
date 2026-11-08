@@ -215,8 +215,10 @@ public final class MagazineFeed {
     // with the real state; until then every view of the post (the grid card, its enlarged card, a
     // rebuilt card) shows what the reader just did, so the views never disagree. Main thread only.
     private static final java.util.Map<String, PendingEngagement> pendingEngagement = new java.util.HashMap<>();
-    // If X never confirms (the action failed, say), its own state wins again after this long.
-    private static final long PENDING_TTL_MS = 60_000L;
+    // A re-send that still disagrees this long after the action is X's real state (the action
+    // failed, or was undone elsewhere); earlier ones are re-sends X made before applying it.
+    // There is no plain timeout: if X never re-sends the post, the reader's action stays shown.
+    private static final long PENDING_GRACE_MS = 20_000L;
 
     private static final class PendingEngagement {
         final Engagement engagement;
@@ -230,27 +232,39 @@ public final class MagazineFeed {
     /** The engagement to show for a card: the reader's pending action, else X's own. */
     private static Engagement shownEngagement(PostCard card) {
         PendingEngagement pending = card.postId == null ? null : pendingEngagement.get(card.postId);
-        if (pending == null) return card.engagement;
-        if (android.os.SystemClock.uptimeMillis() - pending.at > PENDING_TTL_MS) {
-            pendingEngagement.remove(card.postId);
-            return card.engagement;
-        }
-        return pending.engagement;
+        return pending == null ? card.engagement : pending.engagement;
     }
 
     private static void rememberAction(PostCard card, Engagement next) {
         if (card.postId != null) pendingEngagement.put(card.postId, new PendingEngagement(next));
     }
 
-    /** Drops a pending action once X's own state for the post agrees with it (X's counts win). */
+    /**
+     * Called with each copy of a post X sends. Drops the pending action once X's state agrees with
+     * it (X's counts win from then on), or once X still disagrees after the grace period.
+     */
     private static void reconcile(PostCard card) {
         PendingEngagement pending = card.postId == null ? null : pendingEngagement.get(card.postId);
         if (pending == null) return;
         Engagement x = card.engagement;
         Engagement mine = pending.engagement;
-        if (x.liked == mine.liked && x.reposted == mine.reposted && x.bookmarked == mine.bookmarked) {
+        boolean agrees = x.liked == mine.liked && x.reposted == mine.reposted && x.bookmarked == mine.bookmarked;
+        if (agrees || android.os.SystemClock.uptimeMillis() - pending.at > PENDING_GRACE_MS) {
             pendingEngagement.remove(card.postId);
         }
+    }
+
+    /**
+     * The newest copy of a card's post in the live feeds: X's latest state and timeline item. A
+     * card's tap and media hold the copy they were built with, which X may have replaced since.
+     */
+    private static PostCard freshCard(PostCard card) {
+        if (card == null || card.postId == null) return card;
+        for (MagazineView view : new ArrayList<>(liveViews)) {
+            PostCard fresh = view.cardFor(card.postId);
+            if (fresh != null) return fresh;
+        }
+        return card;
     }
 
     // ---------- Home re-select ----------
@@ -287,10 +301,23 @@ public final class MagazineFeed {
         return best;
     }
 
-    /** After the focus view closes, shows on the grid card whatever the reader did in it. */
-    private static void refreshGridCard(String postId) {
+    /**
+     * Redraws every live grid card of this post with what it should show now: after the focus
+     * view closes, and after an action (the same post can sit in For You and Following, or twice
+     * in one feed). {@code except}: a view inside the card the action came from, which is skipped
+     * since it already shows the action (rebuilding it would cut the tap's press feedback).
+     */
+    private static void refreshGridCard(String postId, View except) {
         if (postId == null) return;
-        for (MagazineView view : new ArrayList<>(liveViews)) view.refreshCard(postId);
+        for (MagazineView view : new ArrayList<>(liveViews)) view.refreshCard(postId, except);
+    }
+
+    private static boolean isInside(View view, View ancestor) {
+        for (View current = view; current != null;
+             current = current.getParent() instanceof View parent ? parent : null) {
+            if (current == ancestor) return true;
+        }
+        return false;
     }
 
     // ---------- Opening things in X ----------
@@ -336,7 +363,10 @@ public final class MagazineFeed {
      * dimmed where the device has no window blur) behind it. Tapping outside, back, or the close
      * button returns to the timeline untouched; nothing is navigated.
      */
-    private static void showFocus(Context context, PostCard card) {
+    private static void showFocus(Context context, PostCard tapped) {
+        // The tapped card or image may hold an older copy of the post (from before a like that X
+        // has since confirmed); the enlarged card shows the newest one.
+        PostCard card = freshCard(tapped);
         Activity activity = NewXUtils.findActivity(context);
         if (activity == null || activity.isFinishing()) {
             openInX(context, card.postLink());
@@ -429,7 +459,7 @@ public final class MagazineFeed {
         dialog.setOnDismissListener(d -> {
             if (focusDialog == dialog) focusDialog = null;
             // A like/repost/bookmark done in the enlarged card shows on the grid card at once.
-            refreshGridCard(card.postId);
+            refreshGridCard(card.postId, null);
         });
         focusDialog = dialog;
         dialog.show();
@@ -603,8 +633,12 @@ public final class MagazineFeed {
             }
         }
 
-        void refreshCard(String postId) {
-            grid.refreshCard(postId);
+        void refreshCard(String postId, View except) {
+            grid.refreshCard(postId, except);
+        }
+
+        PostCard cardFor(String postId) {
+            return grid.cardFor(postId);
         }
 
         // X's bundled NestedScrollView is R8-optimized: methods X never calls (smoothScrollTo,
@@ -726,12 +760,20 @@ public final class MagazineFeed {
             return -1;
         }
 
-        /** Redraws one card's action row with what it should show now (see shownEngagement). */
-        void refreshCard(String postId) {
-            int index = indexOfPost(postId);
-            if (index >= 0 && index < getChildCount()) {
-                CardViews.rebindEngagement(getChildAt(index), cards.get(index));
+        /** Redraws this post's cards' action rows with what they should show now (see shownEngagement). */
+        void refreshCard(String postId, View except) {
+            if (postId == null) return;
+            for (int i = 0; i < cards.size() && i < getChildCount(); i++) {
+                if (!postId.equals(cards.get(i).postId)) continue;
+                View child = getChildAt(i);
+                if (except != null && isInside(except, child)) continue;
+                CardViews.rebindEngagement(child, cards.get(i));
             }
+        }
+
+        PostCard cardFor(String postId) {
+            int index = indexOfPost(postId);
+            return index >= 0 ? cards.get(index) : null;
         }
 
         /** Returns true when the cards were rebuilt rather than appended to. */
@@ -1040,6 +1082,7 @@ public final class MagazineFeed {
                             state.toggle();
                             paint.run();
                             rememberAction(card, shownEngagement(card).withReposted(state.active, state.count));
+                            refreshGridCard(card.postId, anchor);
                         } else {
                             openInX(context, card.intentLink("retweet", "tweet_id"));
                         }
@@ -1101,6 +1144,7 @@ public final class MagazineFeed {
                     likeState.toggle();
                     paintLike.run();
                     rememberAction(card, shownEngagement(card).withLiked(likeState.active, likeState.count));
+                    refreshGridCard(card.postId, view);
                 } else {
                     openInX(context, card.postLink());
                 }
@@ -1119,6 +1163,7 @@ public final class MagazineFeed {
                     bookmarkState.toggle();
                     paintBookmark.run();
                     rememberAction(card, shownEngagement(card).withBookmarked(bookmarkState.active));
+                    refreshGridCard(card.postId, view);
                     Toast.makeText(context, adding ? "Bookmarked" : "Removed from bookmarks", Toast.LENGTH_SHORT).show();
                 } else {
                     // X has no bookmark link; its own bookmark button is on the post screen.
