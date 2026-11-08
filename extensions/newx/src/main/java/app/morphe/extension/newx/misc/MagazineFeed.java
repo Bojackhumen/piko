@@ -564,8 +564,9 @@ public final class MagazineFeed {
             });
         }
 
+        // Public: NestedScrollView widens View's protected onAttachedToWindow.
         @Override
-        protected void onAttachedToWindow() {
+        public void onAttachedToWindow() {
             super.onAttachedToWindow();
             liveViews.add(this);
         }
