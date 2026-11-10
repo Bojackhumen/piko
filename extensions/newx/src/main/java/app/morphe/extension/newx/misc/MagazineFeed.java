@@ -29,7 +29,6 @@ import android.widget.Toast;
 
 import androidx.core.widget.NestedScrollView;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -54,11 +53,18 @@ import kotlin.jvm.functions.Function1;
  * swaps the native list for an AndroidView when the timeline type is a home timeline and this
  * setting is on. Paging reuses the gallery's bottom-paginator bridge.
  *
- * <p>Every action goes through X itself, by in-app x.com links that X's deep-link router handles
- * ({@code /intent/{action}} with {@code tweet_id}/{@code in_reply_to}, verified in 12.40.1's
- * {@code com.x.android.deeplink} handler), so replying, reposting and liking run X's own flows.
- * Bookmarking has no such link and opens the post, where X's own bookmark button is. Counts and
- * liked/reposted state are not part of the timeline item, so the buttons show neither.
+ * <p>Every action goes through X itself. Like, repost and bookmark (and undoing them) run in
+ * place through X's own post-actions service, which the patch captures and bridges to (see
+ * {@link #runAction}); the buttons show X's counts and the reader's own state, read from the
+ * post's inline action entries. Reply, quote, profiles and the full post open by in-app x.com
+ * links that X's deep-link router handles ({@code /intent/{action}}, verified in 12.40.1's
+ * {@code com.x.android.deeplink} handler). Where the bridges are not patched, like and bookmark
+ * fall back to opening the post and repost to X's own repost screen.
+ *
+ * <p>The feed is not a recycling list: every post keeps its card view. To stay light on long
+ * timelines, timeline items are read once per instance ({@link PostCard#extract}), card views
+ * survive a refresh ({@link MasonryGrid#setCards}), and only cards near the screen hold their
+ * pictures ({@link MasonryGrid#updatePictureWindow}).
  */
 public final class MagazineFeed {
     public static final String SETTING_ID = "newx.appearance.piko_2_magazine";
@@ -183,7 +189,10 @@ public final class MagazineFeed {
             return false;
         }
         try {
-            Object post = postResultOf(card.item);
+            // X's newest copy of the post: this card may have been built before X re-sent it.
+            Object item = freshCard(card).item;
+            if (item == null) return false;
+            Object post = postResultOf(item);
             if (post == null) return false;
             if (card.repostedBy != null) {
                 // A repost card shows the original post; act on that one.
@@ -368,7 +377,7 @@ public final class MagazineFeed {
         // has since confirmed); the enlarged card shows the newest one.
         PostCard card = freshCard(tapped);
         Activity activity = NewXUtils.findActivity(context);
-        if (activity == null || activity.isFinishing()) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
             openInX(context, card.postLink());
             return;
         }
@@ -379,6 +388,18 @@ public final class MagazineFeed {
         FrameLayout scrim = new FrameLayout(activity);
         scrim.setOnClickListener(view -> dialog.dismiss());
         scrim.setContentDescription("Close");
+        scrim.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View view) {
+            }
+
+            @Override
+            public void onViewDetachedFromWindow(View view) {
+                // Also reached when the activity goes away with the card still open (the system
+                // removes the window without a dismiss), which would leave a dead dialog here.
+                if (focusDialog == dialog) focusDialog = null;
+            }
+        });
 
         int screenWidth = activity.getResources().getDisplayMetrics().widthPixels;
         int margin = Theme.dpToPx(activity, 16f);
@@ -420,6 +441,8 @@ public final class MagazineFeed {
         int buttonPadding = Theme.dpToPx(activity, 12f);
         openFull.setPadding(buttonPadding, buttonPadding, buttonPadding, buttonPadding);
         openFull.setBackground(CardViews.rounded(Theme.primaryAccent(activity), Theme.dpToPx(activity, 24f)));
+        CardViews.clipToRoundRect(openFull, Theme.dpToPx(activity, 24f));
+        openFull.setForeground(CardViews.pressRipple(activity));
         openFull.setOnClickListener(view -> openInX(activity, card.postLink()));
         LinearLayout.LayoutParams openParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -481,11 +504,24 @@ public final class MagazineFeed {
     }
 
     private static void copyLink(Context context, PostCard card) {
-        String link = shareLink(card);
+        copy(context, "Post link", shareLink(card), "Link copied");
+    }
+
+    private static void copyText(Context context, PostCard card) {
+        copy(context, "Post text", card.text, "Text copied");
+    }
+
+    private static void copy(Context context, String label, String value, String confirmation) {
         ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-        if (link == null || clipboard == null) return;
-        clipboard.setPrimaryClip(ClipData.newPlainText("Post link", link));
-        Toast.makeText(context, "Link copied", Toast.LENGTH_SHORT).show();
+        if (value == null || clipboard == null) return;
+        try {
+            clipboard.setPrimaryClip(ClipData.newPlainText(label, value));
+        } catch (RuntimeException e) {
+            NewXLogger.printException(() -> LOG_PREFIX + "copy failed", e);
+            return;
+        }
+        // Android 13 and later show their own "copied" preview; a toast on top would say it twice.
+        if (android.os.Build.VERSION.SDK_INT < 33) Toast.makeText(context, confirmation, Toast.LENGTH_SHORT).show();
     }
 
     // ---------- Scroll container ----------
@@ -502,6 +538,9 @@ public final class MagazineFeed {
 
         private final MasonryGrid grid;
         private final LoadingIndicatorView loadingIndicator;
+        // Timeline items already read into cards, so an update only reads what is new.
+        private final PostCard.ReadItems readItems = new PostCard.ReadItems();
+        private boolean pictureWindowPosted;
         private boolean restorePending;
         private Object callback;
         private int currentItemCount = -1;
@@ -536,11 +575,16 @@ public final class MagazineFeed {
             });
             setOnScrollChangeListener((View.OnScrollChangeListener) (view, x, y, oldX, oldY) -> {
                 if (!restorePending) rememberAnchor();
+                // Showing a picture asks for a layout, which must not happen inside one.
+                if (isInLayout()) postPictureWindow();
+                else updatePictureWindow();
                 if (y <= oldY || loadMoreInFlight) return;
                 paginationArmed = true;
                 checkLoadMore();
             });
             addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
+                // Cards have their places now: the ones near the screen get their pictures.
+                postPictureWindow();
                 if (!loadMoreInFlight) post(this::checkLoadMore);
             });
 
@@ -550,6 +594,7 @@ public final class MagazineFeed {
             content.setPadding(gap, gap, gap, gap);
 
             grid = new MasonryGrid(context);
+            grid.afterLayout = this::postPictureWindow;
             content.addView(grid, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -633,6 +678,23 @@ public final class MagazineFeed {
             }
         }
 
+        private void postPictureWindow() {
+            if (pictureWindowPosted) return;
+            pictureWindowPosted = true;
+            post(() -> {
+                pictureWindowPosted = false;
+                updatePictureWindow();
+            });
+        }
+
+        /** Tells the grid which part of it is on screen; only cards near it hold their pictures. */
+        private void updatePictureWindow() {
+            int height = getHeight();
+            if (height <= 0) return;
+            int top = getScrollY() - grid.getTop();
+            grid.updatePictureWindow(top, top + height);
+        }
+
         void refreshCard(String postId, View except) {
             grid.refreshCard(postId, except);
         }
@@ -671,7 +733,7 @@ public final class MagazineFeed {
 
         private void setItems(List<?> items) {
             List<?> next = items == null ? Collections.emptyList() : items;
-            List<PostCard> cards = PostCard.extract(next);
+            List<PostCard> cards = PostCard.extract(next, readItems);
             boolean rebuilt = grid.setCards(cards);
             // A new view, or X replacing the timeline (a refresh): keep the reader on their post.
             // Going to the top is an explicit request only (Home re-select, see onReselected), so
@@ -743,6 +805,8 @@ public final class MagazineFeed {
         private List<PostCard> cards = Collections.emptyList();
         private final List<Integer> columnOf = new ArrayList<>();
         private int assignedColumns = -1;
+        // Run after every layout of the cards; set by the scroll container (see updatePictureWindow).
+        private Runnable afterLayout;
 
         MasonryGrid(Context context) {
             super(context);
@@ -767,7 +831,7 @@ public final class MagazineFeed {
                 if (!postId.equals(cards.get(i).postId)) continue;
                 View child = getChildAt(i);
                 if (except != null && isInside(except, child)) continue;
-                CardViews.rebindEngagement(child, cards.get(i));
+                CardViews.rebind(child, cards.get(i));
             }
         }
 
@@ -776,16 +840,40 @@ public final class MagazineFeed {
             return index >= 0 ? cards.get(index) : null;
         }
 
-        /** Returns true when the cards were rebuilt rather than appended to. */
+        /** Returns true when the cards were put in a new order rather than appended to. */
         boolean setCards(List<PostCard> next) {
             boolean appendOnly = next.size() >= cards.size()
                     && next.subList(0, cards.size()).equals(cards);
             if (!appendOnly) {
-                // Refresh or reorder: rebuild, so positions follow the new order.
-                for (PostCard card : next) reconcile(card);
+                // Refresh or reorder: positions follow the new order. Posts that are still there
+                // keep their card view, with its pictures; only new posts are built. Building
+                // every card again blanked the whole feed and fetched every picture again.
+                java.util.Map<String, View> keptViews = new java.util.HashMap<>();
+                java.util.Map<String, PostCard> keptCards = new java.util.HashMap<>();
+                for (int i = 0; i < cards.size() && i < getChildCount(); i++) {
+                    PostCard old = cards.get(i);
+                    if (old.postId == null) continue;
+                    keptViews.put(old.postId, getChildAt(i));
+                    keptCards.put(old.postId, old);
+                }
                 removeAllViews();
                 columnOf.clear();
-                for (PostCard card : next) addView(CardViews.build(getContext(), card));
+                for (PostCard card : next) {
+                    PostCard old = card.postId == null ? null : keptCards.get(card.postId);
+                    Engagement before = old == null ? null : shownEngagement(old);
+                    reconcile(card);
+                    View view = old != null && old.sameContentAs(card) ? keptViews.remove(card.postId) : null;
+                    if (view == null) {
+                        addView(CardViews.build(getContext(), card));
+                        continue;
+                    }
+                    if (old != card || !before.sameAs(shownEngagement(card))) CardViews.rebind(view, card);
+                    addView(view);
+                }
+                // Cards of posts that are gone stop waiting for their pictures.
+                for (View gone : keptViews.values()) {
+                    if (gone instanceof CardRoot root) root.showPictures(false);
+                }
             } else {
                 // Same posts in the same places: refresh only cards whose shown counts or state
                 // changed, e.g. once X re-sends a post the reader just liked. Update the action
@@ -793,10 +881,18 @@ public final class MagazineFeed {
                 // reflows and every post blinks. A stale re-send (X has not applied the action
                 // yet) leaves the reader's pending state on screen rather than flipping it back.
                 for (int i = 0; i < cards.size(); i++) {
-                    Engagement before = shownEngagement(cards.get(i));
-                    reconcile(next.get(i));
-                    if (!before.sameAs(shownEngagement(next.get(i)))) {
-                        CardViews.rebindEngagement(getChildAt(i), next.get(i));
+                    PostCard old = cards.get(i);
+                    PostCard card = next.get(i);
+                    Engagement before = shownEngagement(old);
+                    reconcile(card);
+                    if (!old.sameContentAs(card)) {
+                        // The post itself changed (an edit, or now shown as someone's repost).
+                        View stale = getChildAt(i);
+                        if (stale instanceof CardRoot root) root.showPictures(false);
+                        removeViewAt(i);
+                        addView(CardViews.build(getContext(), card), i);
+                    } else if (!before.sameAs(shownEngagement(card))) {
+                        CardViews.rebind(getChildAt(i), card);
                     }
                 }
                 for (int i = cards.size(); i < next.size(); i++) {
@@ -808,6 +904,36 @@ public final class MagazineFeed {
             boolean rebuilt = !appendOnly && !cards.isEmpty();
             cards = next;
             return rebuilt;
+        }
+
+        // In screen heights: how far ahead of the reader a card's pictures are fetched, and how
+        // far away it must be before they are let go. The gap between the two keeps a card at
+        // the edge from loading and unloading as the reader moves back and forth.
+        private static final float SHOW_WITHIN_SCREENS = 1f;
+        private static final float RELEASE_BEYOND_SCREENS = 2f;
+
+        /**
+         * Only cards near the screen hold their pictures. Every card stays in the grid for as
+         * long as its post is in the timeline, so without this a long timeline kept every
+         * picture in memory, and a feed that X re-created fetched all of them again at once,
+         * the ones on screen last. {@code visibleTop}/{@code visibleBottom}: the part of the
+         * grid on screen, in the grid's own coordinates.
+         */
+        void updatePictureWindow(int visibleTop, int visibleBottom) {
+            int screen = Math.max(1, visibleBottom - visibleTop);
+            int show = Math.round(screen * SHOW_WITHIN_SCREENS);
+            int release = Math.round(screen * RELEASE_BEYOND_SCREENS);
+            for (int i = 0; i < getChildCount(); i++) {
+                // A card not laid out yet has no place; it is looked at again after the layout.
+                if (!(getChildAt(i) instanceof CardRoot card) || !card.isLaidOut()) continue;
+                int top = card.getTop();
+                int bottom = card.getBottom();
+                if (bottom >= visibleTop - show && top <= visibleBottom + show) {
+                    card.showPictures(true);
+                } else if (bottom < visibleTop - release || top > visibleBottom + release) {
+                    card.showPictures(false);
+                }
+            }
         }
 
         private int columnCount(int width) {
@@ -858,6 +984,8 @@ public final class MagazineFeed {
                 child.layout(left, tops[column], left + columnWidth, tops[column] + child.getMeasuredHeight());
                 tops[column] += child.getMeasuredHeight() + gap;
             }
+            // The cards have their places: the scroll container can tell which are near the screen.
+            if (afterLayout != null) afterLayout.run();
         }
 
         private static int shortest(int[] heights) {
@@ -873,25 +1001,58 @@ public final class MagazineFeed {
         private CardViews() {
         }
 
-        // Marks a card's action row so it can be found and refreshed in place (see rebindEngagement).
+        // Mark the parts of a built card that are found again later: the action row and the
+        // "@handle · age · views" line (refreshed in place, see rebind), and the More button
+        // (the menu a long press on the card opens from).
         private static final Object ACTIONS_TAG = new Object();
+        private static final Object BYLINE_TAG = new Object();
+        private static final Object MORE_TAG = new Object();
 
         /**
-         * Refreshes a built card's action row for new engagement without rebuilding the card, so the
-         * media is not reloaded and the masonry grid does not reflow. Used when X re-sends a post
+         * Refreshes a built grid card for a newer copy of the same post without rebuilding it:
+         * the action row (counts and the reader's state) and the byline (age, views). The media
+         * is not reloaded and the masonry grid does not reflow. Used when X re-sends a post, e.g.
          * after a like/repost/bookmark; rebuilding the whole card made every post blink.
          */
-        static void rebindEngagement(View cardRoot, PostCard card) {
+        static void rebind(View cardRoot, PostCard card) {
             if (cardRoot == null) return;
-            View actionRow = cardRoot.findViewWithTag(ACTIONS_TAG);
-            if (actionRow == null || !(actionRow.getParent() instanceof ViewGroup body)) return;
             Context context = cardRoot.getContext();
-            int index = body.indexOfChild(actionRow);
-            body.removeViewAt(index);
-            body.addView(actions(context, card, Theme.secondaryText(context)), index);
+            View actionRow = cardRoot.findViewWithTag(ACTIONS_TAG);
+            if (actionRow != null && actionRow.getParent() instanceof ViewGroup body) {
+                int index = body.indexOfChild(actionRow);
+                body.removeViewAt(index);
+                body.addView(actions(context, card, Theme.secondaryText(context)), index);
+            }
+            View line = cardRoot.findViewWithTag(BYLINE_TAG);
+            String byline = byline(card);
+            if (line instanceof TextView text && byline != null) text.setText(byline);
             cardRoot.setContentDescription(card.describe());
             // Keep the card tap (focus view) pointed at the fresh card.
             cardRoot.setOnClickListener(view -> showFocus(context, card));
+        }
+
+        /** The theme's touch ripple, to lay over a tappable view; null when the theme has none. */
+        static Drawable pressRipple(Context context) {
+            TypedValue value = new TypedValue();
+            try {
+                if (!context.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, value, true)
+                        || value.resourceId == 0) {
+                    return null;
+                }
+                return context.getDrawable(value.resourceId);
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        /** A light tick and a small bounce on the button: the one-tap action went through. */
+        private static void confirm(View button) {
+            button.performHapticFeedback(android.view.HapticFeedbackConstants.CONTEXT_CLICK);
+            button.animate().cancel();
+            button.setScaleX(0.8f);
+            button.setScaleY(0.8f);
+            button.animate().scaleX(1f).scaleY(1f).setDuration(220)
+                    .setInterpolator(new android.view.animation.OvershootInterpolator(3f)).start();
         }
 
         static View build(Context context, PostCard card) {
@@ -904,7 +1065,7 @@ public final class MagazineFeed {
             int ink = Theme.primaryText(context);
             int muted = Theme.secondaryText(context);
 
-            LinearLayout root = new LinearLayout(context);
+            CardRoot root = new CardRoot(context);
             root.setOrientation(LinearLayout.VERTICAL);
             GradientDrawable cardBackground = rounded(Theme.surfaceContainer(context), Theme.dpToPx(context, CARD_RADIUS_DP));
             cardBackground.setStroke(Math.max(1, Theme.dpToPx(context, 1f)), Theme.dividerColor(context));
@@ -916,6 +1077,14 @@ public final class MagazineFeed {
             View.OnClickListener popOut = focal ? null : view -> showFocus(context, card);
             root.setOnClickListener(view -> {
                 if (popOut != null) popOut.onClick(view);
+            });
+            // The card answers the finger; the enlarged card has nothing to open, so it stays still.
+            if (!focal) root.setForeground(pressRipple(context));
+            // A long press anywhere on the card opens the same menu as its More button.
+            root.setOnLongClickListener(view -> {
+                View more = root.findViewWithTag(MORE_TAG);
+                showMoreMenu(more != null ? more : view, card);
+                return true;
             });
             root.setContentDescription(card.describe());
 
@@ -998,6 +1167,10 @@ public final class MagazineFeed {
 
             body.addView(actions(context, card, muted));
             root.addView(body);
+            root.collectPictures(root);
+            // A grid card gets its pictures once it is near the screen (see
+            // MasonryGrid.updatePictureWindow); the enlarged card is on screen now.
+            if (focal) root.showPictures(true);
             return root;
         }
 
@@ -1009,7 +1182,7 @@ public final class MagazineFeed {
             int avatarSize = Theme.dpToPx(context, 32f);
             View avatar = avatar(context, card, avatarSize);
             LinearLayout.LayoutParams avatarParams = new LinearLayout.LayoutParams(avatarSize, avatarSize);
-            avatarParams.rightMargin = Theme.dpToPx(context, 10f);
+            avatarParams.setMarginEnd(Theme.dpToPx(context, 10f));
             head.addView(avatar, avatarParams);
 
             LinearLayout who = new LinearLayout(context);
@@ -1025,21 +1198,28 @@ public final class MagazineFeed {
                 name.setEllipsize(TextUtils.TruncateAt.END);
                 who.addView(name);
             }
-            String views = formatCount(card.engagement.views);
-            String sub = joinNonNull(joinNonNull(card.handle == null ? null : "@" + card.handle, card.age),
-                    views == null ? null : views + " views");
+            String sub = byline(card);
             if (sub != null) {
                 TextView handle = text(context, sub, 13f, muted);
                 handle.setSingleLine(true);
                 handle.setEllipsize(TextUtils.TruncateAt.END);
+                handle.setTag(BYLINE_TAG);
                 who.addView(handle);
             }
             head.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
             View more = iconButton(context, "More", muted, null, "\u22EF", "ic_vector_overflow", "ic_vector_more");
+            more.setTag(MORE_TAG);
             more.setOnClickListener(view -> showMoreMenu(view, card));
             head.addView(more);
             return head;
+        }
+
+        /** "@handle \u00B7 5m \u00B7 1.2K views", worked out when it is shown so the age keeps up. */
+        private static String byline(PostCard card) {
+            String views = formatCount(card.engagement.views);
+            return joinNonNull(joinNonNull(card.handle == null ? null : "@" + card.handle, card.age()),
+                    views == null ? null : views + " views");
         }
 
         private static void showMoreMenu(View anchor, PostCard card) {
@@ -1047,14 +1227,17 @@ public final class MagazineFeed {
             PopupMenu menu = new PopupMenu(context, anchor);
             menu.getMenu().add(0, 1, 0, "Open post");
             menu.getMenu().add(0, 2, 1, "Copy link");
-            menu.getMenu().add(0, 3, 2, "Share via\u2026");
-            if (card.handle != null) menu.getMenu().add(0, 4, 3, "View @" + card.handle);
+            // Not for a post X covers with a warning: the card does not show that text either.
+            if (card.text != null && card.coverText == null) menu.getMenu().add(0, 5, 2, "Copy text");
+            menu.getMenu().add(0, 3, 3, "Share via\u2026");
+            if (card.handle != null) menu.getMenu().add(0, 4, 4, "View @" + card.handle);
             menu.setOnMenuItemClickListener(item -> {
                 switch (item.getItemId()) {
                     case 1 -> openInX(context, card.postLink());
                     case 2 -> copyLink(context, card);
                     case 3 -> sharePost(context, card);
                     case 4 -> openInX(context, profileLink(card.handle));
+                    case 5 -> copyText(context, card);
                     default -> {
                         return false;
                     }
@@ -1081,6 +1264,7 @@ public final class MagazineFeed {
                         if (runAction(card, reposting ? PostAction.REPOST : PostAction.UNREPOST)) {
                             state.toggle();
                             paint.run();
+                            confirm(anchor);
                             rememberAction(card, shownEngagement(card).withReposted(state.active, state.count));
                             refreshGridCard(card.postId, anchor);
                         } else {
@@ -1143,9 +1327,13 @@ public final class MagazineFeed {
                 if (runAction(card, liking ? PostAction.LIKE : PostAction.UNLIKE)) {
                     likeState.toggle();
                     paintLike.run();
+                    confirm(view);
                     rememberAction(card, shownEngagement(card).withLiked(likeState.active, likeState.count));
                     refreshGridCard(card.postId, view);
                 } else {
+                    // Say why the screen changes: the tap was a like, not "open the post".
+                    Toast.makeText(context, liking ? "Like it from the post" : "Unlike it from the post",
+                            Toast.LENGTH_SHORT).show();
                     openInX(context, card.postLink());
                 }
             });
@@ -1162,6 +1350,7 @@ public final class MagazineFeed {
                 if (runAction(card, adding ? PostAction.BOOKMARK : PostAction.UNBOOKMARK)) {
                     bookmarkState.toggle();
                     paintBookmark.run();
+                    confirm(view);
                     rememberAction(card, shownEngagement(card).withBookmarked(bookmarkState.active));
                     refreshGridCard(card.postId, view);
                     Toast.makeText(context, adding ? "Bookmarked" : "Removed from bookmarks", Toast.LENGTH_SHORT).show();
@@ -1236,7 +1425,7 @@ public final class MagazineFeed {
                 counter.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
                 LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                params.leftMargin = Theme.dpToPx(context, 5f);
+                params.setMarginStart(Theme.dpToPx(context, 5f));
                 button.addView(counter, params);
             }
         }
@@ -1292,7 +1481,9 @@ public final class MagazineFeed {
             FrameLayout frame = new FrameLayout(context);
             frame.setBackground(rounded(Theme.dividerColor(context), size / 2f));
             clipToRoundRect(frame, size / 2f);
-            String initial = card.name == null || card.name.isEmpty() ? "?" : card.name.substring(0, 1);
+            // The first whole character: a name can start with an emoji, which is two chars.
+            String initial = card.name == null || card.name.isEmpty()
+                    ? "?" : card.name.substring(0, card.name.offsetByCodePoints(0, 1));
             TextView letter = text(context, initial, 14f, Theme.secondaryText(context));
             letter.setGravity(Gravity.CENTER);
             frame.addView(letter, new FrameLayout.LayoutParams(
@@ -1303,20 +1494,9 @@ public final class MagazineFeed {
                 image.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 frame.addView(image, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                String url = card.avatarUrl;
-                CardImageLoader.load(largerAvatar(url), new CardImageLoader.Callback() {
-                    @Override
-                    public void onLoaded(Bitmap bitmap) {
-                        if (!bitmap.isRecycled()) {
-                            image.setImageBitmap(bitmap);
-                            letter.setVisibility(View.GONE);
-                        }
-                    }
-
-                    @Override
-                    public void onFailed(boolean transientError) {
-                    }
-                });
+                // Fetched with the card's other pictures (see CardRoot); the initial shows meanwhile.
+                frame.setTag(new RemotePicture(image, largerAvatar(card.avatarUrl),
+                        bitmap -> letter.setVisibility(bitmap == null ? View.VISIBLE : View.GONE)));
             }
             return frame;
         }
@@ -1329,6 +1509,7 @@ public final class MagazineFeed {
             tile.setPadding(Theme.dpToPx(context, 12f), vertical, Theme.dpToPx(context, 12f), vertical);
             tile.setBackgroundColor(Theme.dividerColor(context));
             tile.setClickable(true);
+            tile.setForeground(pressRipple(context));
             tile.setOnClickListener(view -> openInX(context, card.postLink()));
             return tile;
         }
@@ -1344,6 +1525,7 @@ public final class MagazineFeed {
             box.setBackground(outline);
             clipToRoundRect(box, radius);
             box.setClickable(true);
+            box.setForeground(pressRipple(context));
             box.setOnClickListener(popOut != null ? popOut : view -> openInX(context, quote.link()));
             box.setContentDescription("Quoted post" + (quote.name == null ? "" : " by " + quote.name));
 
@@ -1478,6 +1660,9 @@ public final class MagazineFeed {
      * own aspect ratio and the tiles exactly fill the width.
      */
     private static final class MediaRow extends ViewGroup {
+        // Real shapes (width / height) of pictures loaded this session, by picture address.
+        private static final android.util.LruCache<String, Float> SEEN_ASPECTS = new android.util.LruCache<>(4000);
+
         private final int gap;
         private final List<Float> aspects = new ArrayList<>();
         // 0 for none; when the natural height is taller, tiles shrink and the row is centered.
@@ -1495,16 +1680,20 @@ public final class MagazineFeed {
 
         void addTile(Context context, MediaItem item, View.OnClickListener click) {
             int index = getChildCount();
-            aspects.add(shownAspect(item.aspect > 0 ? item.aspect : UNKNOWN_ASPECT));
+            // A picture seen before has its real shape on record, so its tile is the right size
+            // from the start and nothing moves when the picture comes (back) in.
+            Float seen = SEEN_ASPECTS.get(item.url);
+            float aspect = seen != null ? seen : item.aspect;
+            aspects.add(shownAspect(aspect > 0 ? aspect : UNKNOWN_ASPECT));
 
             FrameLayout tile = new FrameLayout(context);
             tile.setBackgroundColor(Theme.dividerColor(context));
             tile.setClickable(true);
+            tile.setForeground(CardViews.pressRipple(context));
             tile.setOnClickListener(click);
             tile.setContentDescription(item.video ? "Video" : "Photo " + (index + 1));
             ImageView image = new ImageView(context);
-            image.setScaleType(scaleFor(item.aspect));
-            image.setTag(item.url);
+            image.setScaleType(scaleFor(aspect));
             tile.addView(image, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
             if (item.video) {
@@ -1522,29 +1711,21 @@ public final class MagazineFeed {
             }
             addView(tile);
 
+            // Fetched with the card's other pictures (see CardRoot). Until then, and if it cannot
+            // be fetched, the grey tile stays; tapping still opens X's own viewer.
             String url = item.url;
-            CardImageLoader.load(mediumUrl(url), new CardImageLoader.Callback() {
-                @Override
-                public void onLoaded(Bitmap bitmap) {
-                    if (!url.equals(image.getTag()) || bitmap.isRecycled()) return;
-                    image.setImageBitmap(bitmap);
-                    // The real shape arrives with the image; the model's size is only a hint.
-                    if (bitmap.getWidth() > 0 && bitmap.getHeight() > 0) {
-                        float real = bitmap.getWidth() / (float) bitmap.getHeight();
-                        image.setScaleType(scaleFor(real));
-                        float shown = shownAspect(real);
-                        if (Math.abs(shown - aspects.get(index)) > 0.01f) {
-                            aspects.set(index, shown);
-                            requestLayout();
-                        }
-                    }
+            tile.setTag(new RemotePicture(image, mediumUrl(url), bitmap -> {
+                if (bitmap == null || bitmap.getWidth() <= 0 || bitmap.getHeight() <= 0) return;
+                // The real shape arrives with the image; the model's size is only a hint.
+                float real = bitmap.getWidth() / (float) bitmap.getHeight();
+                SEEN_ASPECTS.put(url, real);
+                image.setScaleType(scaleFor(real));
+                float shown = shownAspect(real);
+                if (Math.abs(shown - aspects.get(index)) > 0.01f) {
+                    aspects.set(index, shown);
+                    requestLayout();
                 }
-
-                @Override
-                public void onFailed(boolean transientError) {
-                    // The grey tile stays; tapping still opens X's own viewer.
-                }
-            });
+            }));
         }
 
         void addVideoTile(Context context, MediaItem item, View.OnClickListener openInPlayer) {
@@ -1626,6 +1807,124 @@ public final class MagazineFeed {
         }
     }
 
+    // ---------- Pictures that come and go with their card ----------
+
+    /**
+     * A picture from the network in an ImageView (a media tile or a profile picture). It is not
+     * fetched when the view is built: its card asks for it when it nears the screen and lets it
+     * go when it is far away again (see {@link CardRoot} and
+     * {@link MasonryGrid#updatePictureWindow}). Main thread only.
+     */
+    private static final class RemotePicture {
+        interface Listener {
+            /** The picture is in the view, or ({@code null}) was let go. */
+            void onPicture(Bitmap bitmap);
+        }
+
+        private static final long FADE_IN_MS = 160L;
+        // After a fetch gave up on a network error, how long until scrolling by tries it again.
+        private static final long RETRY_AFTER_MS = 10_000L;
+
+        private final ImageView image;
+        private final String url;
+        private final Listener listener;
+        // The fetch this picture is waiting on, if any.
+        private CardImageLoader.Callback loading;
+        private boolean wanted;
+        private long retryAfter;
+
+        RemotePicture(ImageView image, String url, Listener listener) {
+            this.image = image;
+            this.url = url;
+            this.listener = listener;
+        }
+
+        /** Safe to call again and again while the card is near the screen. */
+        void show() {
+            wanted = true;
+            if (loading != null || image.getDrawable() != null) return;
+            if (android.os.SystemClock.uptimeMillis() < retryAfter) return;
+            // True while load() is still running: the picture was in memory and is simply set.
+            // One that arrives later fades in rather than popping onto the card.
+            boolean[] immediate = {true};
+            CardImageLoader.Callback callback = new CardImageLoader.Callback() {
+                @Override
+                public void onLoaded(Bitmap bitmap) {
+                    loading = null;
+                    if (!wanted || bitmap.isRecycled()) return;
+                    image.animate().cancel();
+                    image.setImageBitmap(bitmap);
+                    if (immediate[0]) {
+                        image.setAlpha(1f);
+                    } else {
+                        image.setAlpha(0f);
+                        image.animate().alpha(1f).setDuration(FADE_IN_MS).start();
+                    }
+                    if (listener != null) listener.onPicture(bitmap);
+                }
+
+                @Override
+                public void onFailed(boolean transientError) {
+                    // The placeholder stays. A network error is tried again when the reader is
+                    // still (or again) near the card a little later; a picture that is gone is not.
+                    loading = null;
+                    retryAfter = transientError
+                            ? android.os.SystemClock.uptimeMillis() + RETRY_AFTER_MS : Long.MAX_VALUE;
+                }
+            };
+            loading = callback;
+            CardImageLoader.load(url, callback);
+            immediate[0] = false;
+        }
+
+        void release() {
+            wanted = false;
+            if (loading != null) {
+                CardImageLoader.cancel(url, loading);
+                loading = null;
+            }
+            if (image.getDrawable() == null) return;
+            image.animate().cancel();
+            image.setImageDrawable(null);
+            if (listener != null) listener.onPicture(null);
+        }
+    }
+
+    /**
+     * A card's root view. It knows the card's pictures, so the grid can tell a card far from the
+     * screen to let them go and a card coming near to fetch them.
+     */
+    private static final class CardRoot extends LinearLayout {
+        private final List<RemotePicture> pictures = new ArrayList<>();
+        private boolean shown;
+
+        CardRoot(Context context) {
+            super(context);
+        }
+
+        /** Gathers the pictures of every tile and profile picture under {@code view}. */
+        void collectPictures(View view) {
+            if (view.getTag() instanceof RemotePicture picture) pictures.add(picture);
+            if (view instanceof ViewGroup group) {
+                for (int i = 0; i < group.getChildCount(); i++) collectPictures(group.getChildAt(i));
+            }
+        }
+
+        /**
+         * Called on every scroll step for cards near the screen, so showing must stay cheap: a
+         * picture that is in place or on its way returns at once, and one that failed is only
+         * tried again after a pause (see RemotePicture.show).
+         */
+        void showPictures(boolean show) {
+            if (!show && !shown) return;
+            shown = show;
+            for (RemotePicture picture : pictures) {
+                if (show) picture.show();
+                else picture.release();
+            }
+        }
+    }
+
     // ---------- Inline video (focus view) ----------
 
     private interface VideoSizeListener {
@@ -1658,6 +1957,9 @@ public final class MagazineFeed {
         private boolean muted = true;
         private boolean prepared;
         private boolean tracking;
+        // Paused because the app left the screen, to resume on return (not a pause by the reader).
+        private boolean pausedByWindow;
+        private android.media.AudioFocusRequest focusRequest;
         private int videoWidth;
         private int videoHeight;
 
@@ -1893,7 +2195,8 @@ public final class MagazineFeed {
                 mediaPlayer.setDataSource(item.videoUrl);
                 mediaPlayer.setSurface(surface);
                 mediaPlayer.setLooping(item.gif);
-                mediaPlayer.setVolume(0f, 0f);
+                // Muted at first; a player started again keeps the reader's sound choice.
+                mediaPlayer.setVolume(muted ? 0f : 1f, muted ? 0f : 1f);
                 mediaPlayer.setOnPreparedListener(mp -> {
                     if (player != mp) return;
                     prepared = true;
@@ -1903,8 +2206,13 @@ public final class MagazineFeed {
                         scrubber.setEnabled(duration > 0);
                     }
                     if (totalLabel != null) totalLabel.setText(formatTime(duration));
-                    mp.start();
-                    playBadge.setVisibility(View.GONE);
+                    if (getWindowVisibility() == View.VISIBLE) {
+                        mp.start();
+                        setPlaying(true);
+                    } else {
+                        // The app left the screen while the video was getting ready.
+                        pausedByWindow = true;
+                    }
                     removeCallbacks(progressTick);
                     post(progressTick);
                 });
@@ -1919,11 +2227,11 @@ public final class MagazineFeed {
                     sizeListener.onSize(width, height);
                     fitVideo();
                 });
-                mediaPlayer.setOnCompletionListener(mp -> playBadge.setVisibility(View.VISIBLE));
+                mediaPlayer.setOnCompletionListener(mp -> setPlaying(false));
                 mediaPlayer.setOnErrorListener((mp, what, extra) -> {
                     log("inline video failed what=" + what + " extra=" + extra);
                     poster.setVisibility(View.VISIBLE);
-                    playBadge.setVisibility(View.VISIBLE);
+                    setPlaying(false);
                     return true;
                 });
                 mediaPlayer.prepareAsync();
@@ -1942,13 +2250,85 @@ public final class MagazineFeed {
             try {
                 if (mediaPlayer.isPlaying()) {
                     mediaPlayer.pause();
-                    playBadge.setVisibility(View.VISIBLE);
+                    setPlaying(false);
                 } else {
                     mediaPlayer.start();
-                    playBadge.setVisibility(View.GONE);
+                    setPlaying(true);
                 }
             } catch (IllegalStateException e) {
                 // Still preparing; it starts on its own when ready.
+            }
+        }
+
+        /** The play badge shows while the video is stopped; the screen stays on while it plays. */
+        private void setPlaying(boolean playing) {
+            playBadge.setVisibility(playing ? View.GONE : View.VISIBLE);
+            // A GIF loops for as long as the card is open; it must not keep the screen awake.
+            setKeepScreenOn(playing && !item.gif);
+        }
+
+        /**
+         * The app left the screen (Home, another app, the screen turned off) with the card still
+         * open: the player would carry on behind it, sound included. Pause, and pick up where
+         * it was on return.
+         */
+        @Override
+        protected void onWindowVisibilityChanged(int visibility) {
+            super.onWindowVisibilityChanged(visibility);
+            android.media.MediaPlayer mediaPlayer = player;
+            if (mediaPlayer == null || !prepared) return;
+            try {
+                if (visibility != View.VISIBLE) {
+                    if (!mediaPlayer.isPlaying()) return;
+                    mediaPlayer.pause();
+                    pausedByWindow = true;
+                    setKeepScreenOn(false);
+                    abandonAudioFocus();
+                } else if (pausedByWindow) {
+                    pausedByWindow = false;
+                    mediaPlayer.start();
+                    setPlaying(true);
+                    if (!muted) requestAudioFocus();
+                }
+            } catch (IllegalStateException ignored) {
+            }
+        }
+
+        /**
+         * With its sound on, the video asks other apps to pause theirs, as any player does (it
+         * used to play over music). If another app takes the sound back, the video mutes.
+         */
+        private void requestAudioFocus() {
+            try {
+                android.media.AudioManager audio =
+                        (android.media.AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+                if (audio == null) return;
+                if (focusRequest == null) {
+                    focusRequest = new android.media.AudioFocusRequest.Builder(
+                            android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                            .setAudioAttributes(new android.media.AudioAttributes.Builder()
+                                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
+                                    .build())
+                            .setOnAudioFocusChangeListener(change -> {
+                                // Every loss is negative (AUDIOFOCUS_LOSS and its transient kinds).
+                                if (change < 0 && !muted) toggleSound();
+                            })
+                            .build();
+                }
+                audio.requestAudioFocus(focusRequest);
+            } catch (RuntimeException e) {
+                NewXLogger.printException(() -> LOG_PREFIX + "audio focus request failed", e);
+            }
+        }
+
+        private void abandonAudioFocus() {
+            if (focusRequest == null) return;
+            try {
+                android.media.AudioManager audio =
+                        (android.media.AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+                if (audio != null) audio.abandonAudioFocusRequest(focusRequest);
+            } catch (RuntimeException ignored) {
             }
         }
 
@@ -2003,6 +2383,8 @@ public final class MagazineFeed {
                 } catch (IllegalStateException ignored) {
                 }
             }
+            if (muted) abandonAudioFocus();
+            else requestAudioFocus();
         }
 
         /** Shows the whole frame (letterboxed) when the tile's shape was clamped. */
@@ -2020,6 +2402,8 @@ public final class MagazineFeed {
         private void release() {
             removeCallbacks(progressTick);
             prepared = false;
+            pausedByWindow = false;
+            setKeepScreenOn(false);
             android.media.MediaPlayer mediaPlayer = player;
             player = null;
             if (mediaPlayer != null) {
@@ -2033,6 +2417,7 @@ public final class MagazineFeed {
         @Override
         protected void onDetachedFromWindow() {
             release();
+            abandonAudioFocus();
             if (surface != null) {
                 surface.release();
                 surface = null;
@@ -2073,6 +2458,32 @@ public final class MagazineFeed {
         private CardImageLoader() {
         }
 
+        // A network error (not a missing picture) is tried again this many times, a little later
+        // each time, before the views waiting on it are told it failed.
+        private static final int MAX_RETRIES = 2;
+        private static final long RETRY_DELAY_MS = 1_500L;
+
+        /**
+         * One fetch of one address. Every view that wants the same picture (an author's profile
+         * picture on several cards) waits on the same fetch. Main thread only, except
+         * {@code abandoned}, which the worker reads.
+         */
+        private static final class Request {
+            final String url;
+            final List<Callback> waiting = new ArrayList<>();
+            volatile boolean abandoned;
+
+            Request(String url) {
+                this.url = url;
+            }
+        }
+
+        private static final java.util.Map<String, Request> IN_FLIGHT = new java.util.HashMap<>();
+
+        /**
+         * Main thread. A picture in memory is handed over before this returns; otherwise the
+         * callback is called later, on the main thread.
+         */
         static void load(String url, Callback callback) {
             if (!NewXUtils.isHttpUrl(url)) {
                 MAIN.post(() -> callback.onFailed(false));
@@ -2083,7 +2494,43 @@ public final class MagazineFeed {
                 callback.onLoaded(cached);
                 return;
             }
+            Request request = IN_FLIGHT.get(url);
+            if (request == null) {
+                request = new Request(url);
+                IN_FLIGHT.put(url, request);
+                request.waiting.add(callback);
+                fetch(request, 0);
+            } else {
+                request.waiting.add(callback);
+            }
+        }
+
+        /**
+         * Main thread. Stops waiting for a picture (its card went far off screen). A fetch nobody
+         * waits for any more is dropped if it has not started, so pictures the reader scrolled
+         * past do not hold up the ones on screen.
+         */
+        static void cancel(String url, Callback callback) {
+            Request request = IN_FLIGHT.get(url);
+            if (request == null) return;
+            request.waiting.remove(callback);
+            if (request.waiting.isEmpty()) {
+                request.abandoned = true;
+                IN_FLIGHT.remove(url);
+            }
+        }
+
+        private static void fetch(Request request, int attempt) {
             EXECUTOR.execute(() -> {
+                if (request.abandoned) return;
+                String url = request.url;
+                // An earlier fetch of the same picture, given up on while it ran, may have
+                // finished since this one was queued.
+                Bitmap ready = CACHE.get(url);
+                if (ready != null && !ready.isRecycled()) {
+                    MAIN.post(() -> deliver(request, attempt, ready, false));
+                    return;
+                }
                 Bitmap bitmap = null;
                 boolean transientError = true;
                 java.net.HttpURLConnection connection = null;
@@ -2097,19 +2544,32 @@ public final class MagazineFeed {
                         byte[] data = readAll(connection.getInputStream());
                         if (data != null) bitmap = decode(data);
                     }
-                } catch (java.io.IOException | RuntimeException e) {
-                    transientError = true;
+                } catch (java.io.IOException | RuntimeException | OutOfMemoryError e) {
+                    transientError = !(e instanceof OutOfMemoryError);
                 } finally {
                     if (connection != null) connection.disconnect();
                 }
                 Bitmap result = bitmap;
                 boolean retryable = transientError;
                 if (result != null) CACHE.put(url, result);
-                MAIN.post(() -> {
-                    if (result != null) callback.onLoaded(result);
-                    else callback.onFailed(retryable);
-                });
+                MAIN.post(() -> deliver(request, attempt, result, retryable));
             });
+        }
+
+        private static void deliver(Request request, int attempt, Bitmap result, boolean retryable) {
+            if (request.abandoned) return;
+            if (result == null && retryable && attempt < MAX_RETRIES) {
+                MAIN.postDelayed(() -> {
+                    if (!request.abandoned) fetch(request, attempt + 1);
+                }, RETRY_DELAY_MS * (attempt + 1));
+                return;
+            }
+            IN_FLIGHT.remove(request.url);
+            // A copy: a callback may ask for another picture, which touches these lists.
+            for (Callback callback : new ArrayList<>(request.waiting)) {
+                if (result != null) callback.onLoaded(result);
+                else callback.onFailed(retryable);
+            }
         }
 
         private static byte[] readAll(java.io.InputStream input) throws java.io.IOException {
@@ -2333,17 +2793,21 @@ public final class MagazineFeed {
         final String repostedBy;
         final String replyingTo;
         final QuotedPost quote;
-        final String age;
+        // When the post was made, in epoch milliseconds, or -1 when the model does not say.
+        final long postedAt;
         final boolean sensitiveMedia;
         final String coverText;
         final Engagement engagement;
-        // The live timeline item this card was read from, set by extract(). One-tap actions pass it
-        // to X's post-actions service through the patch bridges; null-safe (actions fall back).
+        // Everything a built card view shows apart from its action row and byline. Two copies of
+        // a post with the same key can share one card view (see sameContentAs).
+        private final String contentKey;
+        // The live timeline post item this card was read from, set by extract(). One-tap actions
+        // pass it to X's post-actions service through the patch bridges; null-safe (actions fall back).
         Object item;
 
         private PostCard(String postId, String name, String handle, String avatarUrl, String text,
                          List<MediaItem> media, String repostedBy, String replyingTo,
-                         QuotedPost quote, String age, boolean sensitiveMedia, String coverText,
+                         QuotedPost quote, long postedAt, boolean sensitiveMedia, String coverText,
                          Engagement engagement) {
             this.postId = postId;
             this.name = name;
@@ -2354,10 +2818,47 @@ public final class MagazineFeed {
             this.repostedBy = repostedBy;
             this.replyingTo = replyingTo;
             this.quote = quote;
-            this.age = age;
+            this.postedAt = postedAt;
             this.sensitiveMedia = sensitiveMedia;
             this.coverText = coverText;
             this.engagement = engagement;
+            StringBuilder key = new StringBuilder();
+            for (String part : new String[]{name, handle, avatarUrl, text, repostedBy, replyingTo, coverText}) {
+                key.append(part).append('\u0001');
+            }
+            key.append(sensitiveMedia);
+            appendMediaKey(key, media);
+            if (quote != null) {
+                key.append('\u0002').append(quote.postId).append('\u0001').append(quote.name)
+                        .append('\u0001').append(quote.handle).append('\u0001').append(quote.text);
+                appendMediaKey(key, quote.media);
+            }
+            this.contentKey = key.toString();
+        }
+
+        private static void appendMediaKey(StringBuilder key, List<MediaItem> media) {
+            for (MediaItem item : media) {
+                key.append('\u0001').append(item.url).append('\u0001').append(item.videoUrl);
+            }
+        }
+
+        /**
+         * True when a card view built for {@code other} shows this card too, once its action row
+         * and byline are refreshed (CardViews.rebind): same post, same words, same pictures.
+         */
+        boolean sameContentAs(PostCard other) {
+            return other == this || (other != null && Objects.equals(postId, other.postId)
+                    && contentKey.equals(other.contentKey));
+        }
+
+        /** "now", "5m", "3h", "2d": how long ago the post was made, as of this call. */
+        String age() {
+            if (postedAt < 0) return null;
+            long seconds = Math.max(0, (System.currentTimeMillis() - postedAt) / 1000);
+            if (seconds < 60) return "now";
+            if (seconds < 3600) return (seconds / 60) + "m";
+            if (seconds < 86400) return (seconds / 3600) + "h";
+            return (seconds / 86400) + "d";
         }
 
         String postLink() {
@@ -2401,38 +2902,98 @@ public final class MagazineFeed {
             return Objects.hashCode(postId);
         }
 
-        static List<PostCard> extract(List<?> items) {
+        /**
+         * The cards already read from timeline items, by item instance. X's items are immutable
+         * (every field of the timeline and post models is final in 12.40.1, so a changed post
+         * is a new instance) and X hands the whole timeline over on every update, so only items
+         * not seen in the previous update need reading. Reading one means printing and parsing
+         * the whole model; doing that for every item on every update grew with the timeline.
+         */
+        static final class ReadItems {
+            private java.util.IdentityHashMap<Object, List<PostCard>> byItem = new java.util.IdentityHashMap<>();
+            private boolean showSensitive;
+        }
+
+        static List<PostCard> extract(List<?> items, ReadItems known) {
+            // What a card shows of sensitive media is decided when it is read.
+            boolean showSensitive = SettingsRegistry.getBooleanOrDefault(SHOW_SENSITIVE_SETTING, false);
+            if (known.showSensitive != showSensitive) {
+                known.showSensitive = showSensitive;
+                known.byItem.clear();
+            }
+            java.util.IdentityHashMap<Object, List<PostCard>> current = new java.util.IdentityHashMap<>();
             List<PostCard> cards = new ArrayList<>();
             // X can hand the same post over more than once: as its own entry and inside a
-            // conversation module (a module becomes one card, for its first post: usually the
-            // thread's parent, which several modules can share), as a post and a repost of it,
-            // or again after a refresh kept the old rows. The native list shows threads as
-            // threads; the grid shows each post once, where X first placed it.
+            // conversation module (several modules can share the thread's parent), as a post and
+            // a repost of it, or again after a refresh kept the old rows. The native list shows
+            // threads as threads; the grid shows each post once, where X first placed it.
             java.util.Set<String> seen = new java.util.HashSet<>();
             int repeated = 0;
-            int repeatedFromModules = 0;
+            int newlyRead = 0;
             for (Object item : items) {
                 if (item == null) continue;
-                try {
-                    String value = item.toString();
-                    PostCard card = read(value);
-                    if (card == null) continue;
+                List<PostCard> fromItem = known.byItem.get(item);
+                if (fromItem == null) {
+                    fromItem = readItem(item);
+                    newlyRead++;
+                }
+                current.put(item, fromItem);
+                for (PostCard card : fromItem) {
                     if (card.postId != null && !seen.add(card.postId)) {
                         repeated++;
-                        if (value.startsWith("UrtTimelineModule(")) repeatedFromModules++;
                         continue;
                     }
-                    card.item = item;
                     cards.add(card);
-                } catch (RuntimeException e) {
-                    NewXLogger.printException(() -> LOG_PREFIX + "could not read a timeline item", e);
                 }
             }
-            if (repeated > 0) {
-                log("skipped " + repeated + " repeated posts (" + repeatedFromModules
-                        + " from modules) of " + items.size() + " items");
+            // Items X no longer sends are forgotten with the old map.
+            known.byItem = current;
+            if (newlyRead > 0) {
+                log("read " + newlyRead + " new of " + items.size() + " items; " + cards.size()
+                        + " cards, " + repeated + " repeated posts skipped");
             }
             return cards;
+        }
+
+        /**
+         * The cards one timeline item becomes: one for a post, one per post for a module (a
+         * conversation, a row of posts), none for anything else (cursors, prompts, "Who to
+         * follow"). Each card keeps its own live post item, which is what X's post-actions
+         * service is handed, so a post inside a module likes and reposts in place like any other.
+         */
+        private static List<PostCard> readItem(Object item) {
+            try {
+                List<Object> posts = null;
+                try {
+                    posts = app.morphe.extension.newx.timeline.NewXTimelineFilter.modulePosts(item);
+                } catch (RuntimeException e) {
+                    NewXLogger.printException(() -> LOG_PREFIX + "could not open a timeline module", e);
+                }
+                // Not a module, or a module whose posts could not be told apart: the item is
+                // read whole, which for a module gives one card (its first post).
+                if (posts == null || posts.isEmpty()) posts = Collections.singletonList(item);
+                List<PostCard> cards = new ArrayList<>(posts.size());
+                for (Object post : posts) {
+                    if (post == null) continue;
+                    String value = post.toString();
+                    PostCard card = read(value);
+                    if (card == null) continue;
+                    // A module read as one card (the model bridges were left unpatched) is not
+                    // a post item; its actions fall back to opening the post.
+                    card.item = value.startsWith("UrtTimelineModule(") ? null : post;
+                    cards.add(card);
+                }
+                return cards;
+            } catch (RuntimeException e) {
+                NewXLogger.printException(() -> LOG_PREFIX + "could not read a timeline item", e);
+                return Collections.emptyList();
+            }
+        }
+
+        /** X's models keep the API's escaping of &amp;, &lt; and &gt;; X undoes it as it draws text. */
+        private static String unescape(String text) {
+            if (text == null || text.indexOf('&') < 0) return text;
+            return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
         }
 
         /*
@@ -2454,13 +3015,13 @@ public final class MagazineFeed {
             String repostedBy = null;
             if (isRepost) {
                 String outerAuthor = ToStringParser.fieldValue(value.substring(canonical), "author");
-                repostedBy = outerAuthor == null ? null : ToStringParser.fieldValue(outerAuthor, "name");
+                repostedBy = outerAuthor == null ? null : unescape(ToStringParser.fieldValue(outerAuthor, "name"));
             }
 
             List<MediaItem> media = mediaOf(shown);
             String text = postText(shown);
             if (text != null && !media.isEmpty()) text = stripTrailingMediaLink(text);
-            if (text != null) text = expandLinks(text, shown);
+            if (text != null) text = unescape(expandLinks(text, shown));
 
             // X's sensitive-content warnings live on the contextual post (Piko's "Show sensitive
             // media" clears them at the model) and on each video. A repost carries them on both
@@ -2482,7 +3043,7 @@ public final class MagazineFeed {
 
             return new PostCard(
                     NewXUtils.rawSourcePostId(value),
-                    NewXUtils.rawSourceDisplayName(value),
+                    unescape(NewXUtils.rawSourceDisplayName(value)),
                     NewXUtils.rawSourceScreenName(value),
                     avatarOf(author),
                     text,
@@ -2490,7 +3051,7 @@ public final class MagazineFeed {
                     repostedBy,
                     ToStringParser.fieldValue(shown, "repliedToUserScreenName"),
                     quoteOf(quoted, showSensitive),
-                    age(ToStringParser.fieldValue(shown, "timestamp")),
+                    epochMillis(ToStringParser.fieldValue(shown, "timestamp")),
                     sensitiveMedia,
                     coverText,
                     Engagement.of(shown)
@@ -2569,7 +3130,7 @@ public final class MagazineFeed {
             List<MediaItem> media = mediaOf(quoted);
             String text = postText(quoted);
             if (text != null && !media.isEmpty()) text = stripTrailingMediaLink(text);
-            if (text != null) text = expandLinks(text, quoted);
+            if (text != null) text = unescape(expandLinks(text, quoted));
             if (!showSensitive) {
                 String own = ownFields(quoted);
                 String cover = coverText(own);
@@ -2579,7 +3140,7 @@ public final class MagazineFeed {
             }
             return new QuotedPost(
                     ToStringParser.fieldValue(quoted, "id"),
-                    author == null ? null : ToStringParser.fieldValue(author, "name"),
+                    author == null ? null : unescape(ToStringParser.fieldValue(author, "name")),
                     author == null ? null : ToStringParser.fieldValue(author, "screenName"),
                     text,
                     media);
@@ -2635,6 +3196,10 @@ public final class MagazineFeed {
             return items;
         }
 
+        // A video variant's size as X writes it into the address: /1920x1080/.
+        private static final java.util.regex.Pattern VARIANT_SIZE =
+                java.util.regex.Pattern.compile("/(\\d{2,5})x(\\d{2,5})/");
+
         /**
          * The mp4 to play inline: MediaVariant(url=, bitRate=, contentType=video/mp4) entries,
          * read the way InlineDownloadButton reads them. The highest resolution X offers: the
@@ -2660,7 +3225,7 @@ public final class MagazineFeed {
                 String contentType = segment.substring(contentTypeStart + ", contentType=".length(), end).trim();
                 if (!InlineDownloadButton.isHttpMp4Variant(url, contentType)) continue;
                 long bitRate = (long) number(segment.substring(bitRateStart + ", bitRate=".length(), contentTypeStart));
-                java.util.regex.Matcher size = java.util.regex.Pattern.compile("/(\\d{2,5})x(\\d{2,5})/").matcher(url);
+                java.util.regex.Matcher size = VARIANT_SIZE.matcher(url);
                 if (size.find()) {
                     int width = Integer.parseInt(size.group(1));
                     if (width > bestWidth) {
@@ -2730,16 +3295,13 @@ public final class MagazineFeed {
             return trimmed.isEmpty() ? null : trimmed;
         }
 
-        private static String age(String timestamp) {
-            if (timestamp == null) return null;
+        /** The model's ISO-8601 timestamp in epoch milliseconds, or -1 when missing or unreadable. */
+        private static long epochMillis(String timestamp) {
+            if (timestamp == null) return -1L;
             try {
-                long seconds = Duration.between(Instant.parse(timestamp), Instant.now()).getSeconds();
-                if (seconds < 60) return "now";
-                if (seconds < 3600) return (seconds / 60) + "m";
-                if (seconds < 86400) return (seconds / 3600) + "h";
-                return (seconds / 86400) + "d";
+                return Instant.parse(timestamp.trim()).toEpochMilli();
             } catch (RuntimeException e) {
-                return null;
+                return -1L;
             }
         }
     }

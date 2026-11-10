@@ -1411,6 +1411,25 @@ private static Object filterTimelineItems(
         return null;
     }
 
+    /**
+     * The posts inside a timeline module (a conversation, a row of posts), as the live timeline
+     * post items X holds, in display order. Null when {@code item} is not a module, which is
+     * also the answer while the model bridges below are unpatched. For features that draw
+     * timeline items themselves (the Piko 2.0 card feed) and need each post's own item.
+     */
+    public static List<Object> modulePosts(Object item) {
+        if (item == null || !isTimelineModule(item)) return null;
+        List<Object> posts = new ArrayList<>();
+        List<?> children = getModuleInnerContent(item);
+        if (children == null) return posts;
+        for (Object child : children) {
+            if (child == null) continue;
+            Object inner = isTimelineModuleItem(child) ? getModuleItem(child) : child;
+            if (inner != null && isTimelinePost(inner)) posts.add(inner);
+        }
+        return posts;
+    }
+
     private static boolean isTimelineModuleItem(Object value) {
         return false;
     }

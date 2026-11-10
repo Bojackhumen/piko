@@ -9,6 +9,7 @@ import app.crimera.patches.common.scopedMatchAll
 import app.crimera.patches.newx.misc.extension.newXExtensionPatch
 import app.crimera.patches.newx.models.newXInlineActionModelResolutionPatch
 import app.crimera.patches.newx.models.newXPostModelResolutionPatch
+import app.crimera.patches.newx.models.newXTimelineModelAdapterPatch
 import app.crimera.patches.newx.models.newXTimelineModelResolutionPatch
 import app.crimera.patches.newx.models.resolvedNewXInlineActionModels
 import app.crimera.patches.newx.models.resolvedNewXPostModels
@@ -360,15 +361,126 @@ private fun patchHomeReselect() {
     }
 }
 
+private const val NESTED_SCROLL_VIEW = "Landroidx/core/widget/NestedScrollView;"
+
+/**
+ * The extension's scroll containers, each with the outer class whose code drives it. They extend
+ * the target's own copy of androidx NestedScrollView.
+ */
+private val NESTED_SCROLL_CONTAINERS = mapOf(
+    "Lapp/morphe/extension/newx/misc/MagazineFeed\$MagazineView;" to
+        "Lapp/morphe/extension/newx/misc/MagazineFeed",
+    "Lapp/morphe/extension/newx/misc/ProfilePhotosGallery\$GalleryView;" to
+        "Lapp/morphe/extension/newx/misc/ProfilePhotosGallery",
+)
+
+/**
+ * What stock NestedScrollView declares and the framework's View classes do not: a call to one of
+ * these on a scroll container can only resolve in the target's copy of the class.
+ */
+private val NESTED_SCROLL_VIEW_ONLY_METHODS = setOf(
+    "arrowScroll",
+    "executeKeyEvent",
+    "fling",
+    "fullScroll",
+    "getMaxScrollAmount",
+    "isFillViewport",
+    "isSmoothScrollingEnabled",
+    "pageScroll",
+    "setFillViewport",
+    "setSmoothScrollingEnabled",
+    "smoothScrollBy",
+    "smoothScrollTo",
+)
+
+/**
+ * The extension is compiled against stock androidx, but its scroll containers load against the
+ * target's R8-optimized copy, where methods X never overrides are final and methods X never calls
+ * are renamed or removed. Overriding or calling one of those compiles, patches and installs
+ * cleanly, and then fails on the device: `LinkageError: ... overrides final method` as soon as the
+ * card feed is switched on (the 2026-11-08 Piko 2.0 crash), or `NoSuchMethodError` at the call.
+ * Both are checked here against the exact target instead, so such a build fails at patch time.
+ */
+context(context: BytecodePatchContext)
+private fun requireScrollContainersLink() {
+    val problems = mutableListOf<String>()
+    NESTED_SCROLL_CONTAINERS.forEach { (containerType, ownerPrefix) ->
+        val container = context.classDefBy(containerType)
+        // The ancestors the target defines itself; the chain ends where the framework begins.
+        val ancestors = generateSequence(
+            container.superclass?.let { context.classDefByOrNull(it) },
+        ) { ancestor -> ancestor.superclass?.let { context.classDefByOrNull(it) } }.toList()
+        if (ancestors.none { it.type == NESTED_SCROLL_VIEW }) {
+            throw PatchException(
+                "NewX Piko 2.0: $containerType does not extend the target's $NESTED_SCROLL_VIEW, " +
+                    "so its link check no longer applies",
+            )
+        }
+
+        val overridable = container.methods.filter { method ->
+            !method.name.startsWith("<") &&
+                !AccessFlags.STATIC.isSet(method.accessFlags) &&
+                !AccessFlags.PRIVATE.isSet(method.accessFlags)
+        }
+        ancestors.forEach { ancestor ->
+            ancestor.methods.forEach { inherited ->
+                val isOverridden = AccessFlags.FINAL.isSet(inherited.accessFlags) &&
+                    !AccessFlags.STATIC.isSet(inherited.accessFlags) &&
+                    (
+                        AccessFlags.PUBLIC.isSet(inherited.accessFlags) ||
+                            AccessFlags.PROTECTED.isSet(inherited.accessFlags)
+                    ) &&
+                    overridable.any { method ->
+                        method.name == inherited.name &&
+                            method.returnType == inherited.returnType &&
+                            method.parameterDescriptors() == inherited.parameterDescriptors()
+                    }
+                if (isOverridden) {
+                    problems += "$containerType overrides final ${inherited.smaliReference()}"
+                }
+            }
+        }
+
+        val hierarchy = ancestors.map { it.type }.toSet() + containerType
+        val defined = (ancestors + container)
+            .flatMap { classDef -> classDef.methods.map { it.name to it.parameterDescriptors() } }
+            .toSet()
+        context.classDefForEach { classDef ->
+            if (!classDef.type.startsWith(ownerPrefix)) return@classDefForEach
+            classDef.methods.forEach { method ->
+                method.implementation?.instructions?.forEach { instruction ->
+                    val call = instruction.getReference<MethodReference>() ?: return@forEach
+                    if (call.definingClass !in hierarchy || call.name !in NESTED_SCROLL_VIEW_ONLY_METHODS) {
+                        return@forEach
+                    }
+                    val signature = call.name to call.parameterTypes.map(CharSequence::toString)
+                    if (signature !in defined) {
+                        problems += "${classDef.type}->${method.name} calls ${call.definingClass}->" +
+                            "${call.name}(${call.parameterTypes.joinToString("")})${call.returnType}, " +
+                            "which the target's NestedScrollView does not have"
+                    }
+                }
+            }
+        }
+    }
+    if (problems.isNotEmpty()) {
+        throw PatchException(
+            "NewX Piko 2.0: the card feed would not load on this target: " +
+                problems.distinct().joinToString("; "),
+        )
+    }
+}
+
 /**
  * Piko 2.0: the X Magazine userscript's card grid for the home timeline.
  *
  * The divert itself lives in the shared URT timeline-body preamble that
  * [newXProfilePhotosGalleryPatch] emits, because both features replace the same composable with an
  * AndroidView and reuse its paging bridge. This patch owns the setting, proves that the
- * home-timeline branch was emitted, and wires one-tap like/unlike/repost/bookmark to X's own
- * post-actions service. That wiring is optional: when it cannot be resolved the cards keep using
- * X's in-app action links, so the layout still ships.
+ * home-timeline branch was emitted and that the extension's scroll containers link against the
+ * target's own NestedScrollView ([requireScrollContainersLink]), and wires one-tap
+ * like/unlike/repost/bookmark to X's own post-actions service. That wiring is optional: when it
+ * cannot be resolved the cards keep using X's in-app action links, so the layout still ships.
  */
 @Suppress("unused")
 val newXMagazineFeedPatch =
@@ -384,6 +496,9 @@ val newXMagazineFeedPatch =
             newXPostModelResolutionPatch,
             newXInlineActionModelResolutionPatch,
             newXTimelineModelResolutionPatch,
+            // Fills the timeline filter's module accessors, which the feed uses to give each post
+            // inside a module (a conversation) its own card and its own live post item.
+            newXTimelineModelAdapterPatch,
         )
 
         newXToggle(
@@ -402,6 +517,8 @@ val newXMagazineFeedPatch =
                         "expose every home timeline constant, so the magazine branch was not emitted",
                 )
             }
+            // Required: a container that cannot load crashes the app the moment the feed is shown.
+            requireScrollContainersLink()
             // Optional by design (see the patch KDoc): the extension treats unpatched bridges as
             // "use the link instead".
             runCatching { patchCardActions(resolvePostActions()) }
