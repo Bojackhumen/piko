@@ -48,7 +48,7 @@ the reasons in 1 and 2; the weight of each item on the reporter's device is not 
 
 ## Fix
 
-In `MagazineFeed` (extension only; the patch is unchanged):
+In `MagazineFeed` (extension only; the patch is unchanged), `2980d69` and `099191d`:
 
 - A post is built and measured when it arrives, as before `e06ada1`, so it is placed by its
   real height and scrolling down builds nothing. Empty slots keep the height their card was
@@ -58,6 +58,8 @@ In `MagazineFeed` (extension only; the patch is unchanged):
   listener, a layout or a draw, nearest first, for 4 ms a frame while the feed moves (12 ms at
   rest, one card at least). The "racing" rule is gone.
 - The scroll listener only records the place and posts; `checkLoadMore` is posted too.
+- Home from deep in the feed: the first screen of the feed counts as on screen while the feed
+  glides there, so its cards and pictures are ready when it lands (`099191d`).
 - The reader's place is put back in the scroll view's own layout listener, in the same pass.
   A touch cancels a place still waiting. A layout request that was lost (3) is asked for again.
 - A new width (rotation, resize) is the one case left with stand-in heights, because building
@@ -88,7 +90,7 @@ In `MagazineFeed` (extension only; the patch is unchanged):
   about 250 card positions over some 850 stand-ins, by how good the stand-ins are; about 2500
   without the columns giving way). At most about 110 card views alive.
 - Local: syntax check, and the NestedScrollView link check against the 12.40.1 dex
-  (`problems: 0`). Compiled and linted by the `Build Piko 2.0 patches` workflow for the commit
-  that adds this entry.
+  (`problems: 0`). Compiled and linted by the `Build Piko 2.0 patches` workflow: run
+  43055270231 for `2980d69`, run 43056243922 for `099191d`, both green.
 - No agent device interaction. Whether the report is resolved on the SM-X930 is the reporter's
   to confirm.
