@@ -62,9 +62,11 @@ import kotlin.jvm.functions.Function1;
  * fall back to opening the post and repost to X's own repost screen.
  *
  * <p>To stay light on long timelines, timeline items are read once per instance
- * ({@link PostCard#extract}), and only the cards near the screen exist as views and hold their
- * pictures: every post keeps a place in the grid ({@link CardSlot}), which is empty while the
- * post is far from the screen ({@link MasonryGrid#updateWindow}).
+ * ({@link PostCard#extract}), and only the cards within a few screens of the reader exist as
+ * views and hold their pictures: every post keeps a place in the grid ({@link CardSlot}), which
+ * is empty while the post is far away ({@link MasonryGrid#updateWindow}). A place is as tall
+ * as its card really is: a card is built and measured before it is first placed, so nothing
+ * in the grid moves when cards are let go or come back.
  */
 public final class MagazineFeed {
     public static final String SETTING_ID = "newx.appearance.piko_2_magazine";
@@ -732,12 +734,27 @@ public final class MagazineFeed {
         // Timeline items already read into cards, so an update only reads what is new.
         private final PostCard.ReadItems readItems = new PostCard.ReadItems();
         private boolean windowPosted;
-        // Where the feed was at the last scroll step, and until when it counts as racing past
-        // (see noteScrollStep).
-        private int lastScrollY;
-        private long racingUntil;
-        private final Runnable afterRacing = this::updateWindow;
+        private final Runnable windowPass = () -> {
+            windowPosted = false;
+            updateWindow();
+        };
+        // Where the feed was when the cards near the screen were last looked at (see updateWindow).
+        private int lastWindowY;
+        private boolean loadMoreCheckPosted;
+        private final Runnable loadMoreCheck = () -> {
+            loadMoreCheckPosted = false;
+            checkLoadMore();
+        };
+        // The reader's place is about to be put back (or cannot be found yet, while the posts
+        // are not here): until then scrolling is not taken for the reader's own.
         private boolean restorePending;
+        // The place the next layout puts back; null when none is waiting for one.
+        private Anchor restoreTarget;
+        // Layouts that place has waited through already; it is not waited for without end.
+        private int restoreTries;
+        private static final int MAX_RESTORE_TRIES = 3;
+        // Layouts pushed through by hand since the reader last touched the feed (see updateWindow).
+        private int layoutRepairs;
         private Object callback;
         private int currentItemCount = -1;
         private boolean loadMoreInFlight;
@@ -769,23 +786,9 @@ public final class MagazineFeed {
                     if (topAnimator != null) topAnimator.cancel();
                 }
             });
-            setOnScrollChangeListener((View.OnScrollChangeListener) (view, x, y, oldX, oldY) -> {
-                if (!restorePending) rememberAnchor();
-                noteScrollStep(y);
-                // Building a card or showing a picture asks for a layout, which must not
-                // happen inside one.
-                if (isInLayout()) postWindow();
-                else updateWindow();
-                if (y <= oldY || loadMoreInFlight) return;
-                paginationArmed = true;
-                checkLoadMore();
-            });
-            addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
-                // Cards have their places now: the ones near the screen are built and get
-                // their pictures.
-                postWindow();
-                if (!loadMoreInFlight) post(this::checkLoadMore);
-            });
+            // The listeners only call methods: the grid they work on is made further down.
+            setOnScrollChangeListener((View.OnScrollChangeListener) (view, x, y, oldX, oldY) -> onScrolled(y, oldY));
+            addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> afterLayout());
 
             LinearLayout content = new LinearLayout(context);
             content.setOrientation(LinearLayout.VERTICAL);
@@ -812,6 +815,38 @@ public final class MagazineFeed {
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             restorePending = !anchors.isEmpty();
             setItems(items);
+        }
+
+        private void onScrolled(int y, int oldY) {
+            // The top edge of this view in the grid's coordinates; the content starts below
+            // the top inset, and shows through it when scrolled.
+            grid.setViewportTop(y - getPaddingTop() - grid.getTop());
+            if (!restorePending) rememberAnchor();
+            // Nothing that adds or removes a view is done from in here. A scroll step can come
+            // from inside a layout (the scroll view putting its place back) or a draw (a
+            // fling), and Compose lays this view out from its own draw, where isInLayout() is
+            // false: a layout asked for there can be lost for good.
+            postWindow();
+            if (y <= oldY || loadMoreInFlight) return;
+            paginationArmed = true;
+            postLoadMoreCheck();
+        }
+
+        /** This view was laid out: the cards have their places. */
+        private void afterLayout() {
+            // First the reader's own place: one waiting to be put back is put back here, in
+            // the same pass, before anything is drawn.
+            boolean restoring = restoreTarget != null;
+            finishRestore();
+            // Cards above the reader took their real heights and all cards moved by this much
+            // with them (see MasonryGrid.onMeasure): the feed moves along, so that nothing on
+            // screen does. Not when the reader's place was just put back, or is about to be:
+            // that goes by the cards' new places already.
+            int shift = grid.takeScrollShift();
+            if (shift != 0 && !restoring) scrollBy(0, shift);
+            // Then the cards near the screen are built and get their pictures.
+            postWindow();
+            if (!loadMoreInFlight) postLoadMoreCheck();
         }
 
         private void rememberAnchor() {
@@ -876,36 +911,58 @@ public final class MagazineFeed {
             return best;
         }
 
-        /** After the cards are laid out, puts the remembered post back at the top of the screen. */
+        /**
+         * When the cards are next laid out, puts the remembered post back at the top of the
+         * screen (see finishRestore). Not on the window's next global layout, as it used to be:
+         * Compose lays this view out without one, so that could come seconds later, after the
+         * reader had scrolled on, and pull the feed back.
+         */
         private void restoreAnchorAfterLayout() {
+            restoreTarget = null;
+            restoreTries = 0;
             if (grid.isEmpty()) {
                 // No posts to find the place among yet; tried again when they arrive.
                 restorePending = anchor != null || !anchors.isEmpty();
                 return;
             }
             if (anchor == null) anchor = findAnchor();
-            if (anchor == null) {
-                restorePending = false;
-                return;
+            restorePending = anchor != null;
+            if (anchor == null) return;
+            restoreTarget = anchor;
+            // The layout that follows has the cards around this post built, not the top's.
+            grid.buildAround(anchor.postId);
+        }
+
+        /** Run after each layout of this view: the cards are where they belong. */
+        private void finishRestore() {
+            Anchor target = restoreTarget;
+            if (target == null || grid.getWidth() <= 0) return;
+            int index = grid.indexOfPost(target.postId);
+            View card = index >= 0 && index < grid.getChildCount() ? grid.getChildAt(index) : null;
+            boolean lastTry = ++restoreTries >= MAX_RESTORE_TRIES;
+            if (card != null && !card.isLaidOut()) {
+                // Not placed yet: this layout was not the grid's own. The next one.
+                if (!lastTry) return;
+                card = null;
             }
-            restorePending = true;
-            Anchor target = anchor;
-            // The layout that follows builds the cards around this post, not around the top.
-            grid.setFocus(target.postId);
-            getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
-                @Override
-                public void onGlobalLayout() {
-                    getViewTreeObserver().removeOnGlobalLayoutListener(this);
-                    int index = grid.indexOfPost(target.postId);
-                    if (index >= 0) {
-                        View card = grid.getChildAt(index);
-                        int y = grid.getTop() + card.getTop() + target.offsetFor(card.getHeight());
-                        scrollTo(0, Math.max(0, y));
-                        log("restored position at post " + target.postId);
-                    }
-                    restorePending = false;
-                }
-            });
+            // When the grid has another layout coming (one was asked for during this one), the
+            // place is put back now and once more after that layout.
+            if (card == null || lastTry || !grid.isLayoutRequested()) restoreTarget = null;
+            if (card != null) {
+                int y = grid.getTop() + card.getTop() + target.offsetFor(card.getHeight());
+                // Still pending while this scroll is made: it is not the reader's own, and
+                // must not be remembered as a new place.
+                scrollTo(0, Math.max(0, y));
+                log("restored position at post " + target.postId);
+            }
+            restorePending = restoreTarget != null;
+        }
+
+        /** The reader has taken over: a place still waiting to be put back no longer is. */
+        private void cancelRestore() {
+            if (restoreTarget == null) return;
+            restoreTarget = null;
+            restorePending = false;
         }
 
         /**
@@ -915,7 +972,9 @@ public final class MagazineFeed {
          */
         void onReselected() {
             forgetAnchor();
+            restoreTarget = null;
             restorePending = false;
+            grid.settleTop();
             if (getScrollY() > 0) {
                 glideToTop();
                 return;
@@ -936,48 +995,51 @@ public final class MagazineFeed {
         private void postWindow() {
             if (windowPosted) return;
             windowPosted = true;
-            post(() -> {
-                windowPosted = false;
-                updateWindow();
-            });
+            // With the next frame, before it is measured and drawn: outside any layout or
+            // draw, and once a frame at most, which is what spreads building over frames.
+            postOnAnimation(windowPass);
         }
 
-        // More than this share of a screen in one scroll step is not reading or flinging (the
-        // fastest fling moves a fraction of it per frame) but racing past: the glide to the top
-        // from deep in the feed, or a jump to a remembered place.
-        private static final float RACING_SCREENS = 0.5f;
-        // A racing step counts for this long, a few frames: the next one renews it.
-        private static final long RACING_HOLD_MS = 64L;
-
-        /**
-         * While the feed races past, no cards are built: they would be gone again before they
-         * were seen, and building them makes the glide stutter. A slower step ends the race at
-         * once (the glide slowing down at its end); if no step follows at all (a jump), the
-         * look taken shortly after does.
-         */
-        private void noteScrollStep(int y) {
-            int height = getHeight();
-            if (height > 0 && Math.abs(y - lastScrollY) > height * RACING_SCREENS) {
-                racingUntil = android.os.SystemClock.uptimeMillis() + RACING_HOLD_MS;
-                removeCallbacks(afterRacing);
-                postDelayed(afterRacing, RACING_HOLD_MS + 16L);
-            } else {
-                racingUntil = 0L;
-            }
-            lastScrollY = y;
+        private void postLoadMoreCheck() {
+            if (loadMoreCheckPosted) return;
+            loadMoreCheckPosted = true;
+            post(loadMoreCheck);
         }
+
+        // How long cards may be built for in one frame (one card at least). Short while the
+        // feed moves, so that it keeps up with the finger; longer at rest, to fill the screen.
+        private static final long BUILD_NANOS_MOVING = 4_000_000L;
+        private static final long BUILD_NANOS_AT_REST = 12_000_000L;
+        private static final int MAX_LAYOUT_REPAIRS = 8;
 
         /**
          * Tells the grid which part of it is on screen: cards near it are built and hold their
-         * pictures, cards far from it are let go.
+         * pictures, cards far from it are let go. Only ever run from postWindow().
          */
         private void updateWindow() {
             int height = getHeight();
             if (height <= 0) return;
-            boolean racing = android.os.SystemClock.uptimeMillis() < racingUntil;
-            grid.setRacing(racing);
-            int top = getScrollY() - grid.getTop();
-            grid.updateWindow(top, top + height, !racing);
+            // A layout that was asked for inside a layout pass Compose ran stops at this view
+            // (which was still being laid out) and is then forgotten: the cards wait for a
+            // layout nobody knows about, and every later request stops at them. Seen from
+            // out here, that is a child wanting a layout while this view does not.
+            View content = getChildAt(0);
+            if (content != null && content.isLayoutRequested() && !isLayoutRequested()
+                    && layoutRepairs < MAX_LAYOUT_REPAIRS) {
+                layoutRepairs++;
+                log("layout request was lost; asked again");
+                requestLayout();
+            }
+            // While a place waits to be put back, the screen is not where the reader will be.
+            if (restorePending) return;
+            int y = getScrollY();
+            boolean moving = y != lastWindowY;
+            lastWindowY = y;
+            int top = y - grid.getTop();
+            boolean more = grid.updateWindow(top, top + height,
+                    moving ? BUILD_NANOS_MOVING : BUILD_NANOS_AT_REST);
+            // Cards near the screen are still waiting: the next frame goes on with them.
+            if (more) postWindow();
         }
 
         void refreshCard(String postId, View except) {
@@ -1040,6 +1102,12 @@ public final class MagazineFeed {
             if (ev.getActionMasked() == MotionEvent.ACTION_DOWN || Float.isNaN(downScreenTop)) {
                 downScreenTop = screenTop;
             }
+            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                // From here on the feed goes where the reader takes it.
+                cancelRestore();
+                grid.readerTookOver();
+                layoutRepairs = 0;
+            }
             MotionEvent anchored = MotionEvent.obtain(ev);
             anchored.offsetLocation(0, screenTop - downScreenTop);
             try {
@@ -1086,9 +1154,16 @@ public final class MagazineFeed {
      * not hop between columns as their images load (the userscript's place() works the same way).
      *
      * <p>Every post has a {@link CardSlot} here for as long as it is in the timeline, in timeline
-     * order, but only the slots near the screen hold a built card. The rest are empty and as
-     * tall as their card is known (or guessed) to be, so a timeline of thousands of posts lays
-     * out the same and costs a screenful or two of card views.
+     * order, but only the slots within a few screens of the reader hold a built card. The rest
+     * are empty and exactly as tall as their card was when it was last built, so a timeline of
+     * thousands of posts lays out the same and costs a few screens of card views.
+     *
+     * <p>A post is never first placed by a guessed height. That was tried: a card away from the
+     * screen was sized by an estimate and only built when the reader came near. Building then
+     * happened while scrolling, a fast fling got ahead of it, and each card that was built
+     * late took its real height in view and pushed the cards under it around. Now a new post
+     * is built and measured when it arrives, and scrolling builds nothing new. Only a width
+     * change leaves stand-in heights, and only on slots far from the reader (see EXACT_ABOVE).
      */
     private static final class MasonryGrid extends ViewGroup {
         // The column each post was dealt, by post and column count. A refreshed feed, and one
@@ -1096,47 +1171,60 @@ public final class MagazineFeed {
         // again, so the card being read never moves sideways.
         private static final android.util.LruCache<String, Integer> DEALT = new android.util.LruCache<>(8000);
 
-        // In screen heights from the visible part. Cards are built this far ahead of the reader
-        // and let go this far behind; their pictures likewise, on a tighter window. Each pair
-        // leaves a gap, so a card at the edge is not built and dropped (or its pictures fetched
-        // and let go) as the reader moves back and forth.
-        private static final float BUILD_WITHIN = 1.5f;
-        private static final float RELEASE_BEYOND = 3f;
+        // In screen heights from the visible part. A card that was let go is built again when
+        // the reader comes this near, and cards are let go this far behind; their pictures
+        // likewise, on a tighter window. Each pair leaves a gap, so a card at the edge is not
+        // built and dropped (or its pictures fetched and let go) as the reader moves back and
+        // forth. Cards are kept for a long way: going back a few screens builds nothing.
+        private static final float BUILD_WITHIN = 2f;
+        private static final float RELEASE_BEYOND = 6f;
         private static final float PICTURES_WITHIN = 1f;
         private static final float PICTURES_BEYOND = 2f;
-        // When the cards are measured, the ones around the post the reader is at are built there
-        // and then, before anything is drawn: this far above it and this far below, in screens.
-        // No less than BUILD_WITHIN, or scrolling would at once build what this left out.
-        private static final float MEASURE_BUILD_ABOVE = 1.5f;
-        private static final float MEASURE_BUILD_BELOW = 2.5f;
-        // A card above the reader whose height is only a guess moves the cards under it (the
-        // ones being read, in its column) when the guess is corrected. So when everything is
-        // laid out anew anyway (new posts on top, a new width), up to this many of the nearest
-        // such cards are built once to be measured; they are let go again right after. Further
-        // up, a guess is only corrected when the reader gets there, with a small shift.
-        private static final int MAX_MEASURED_ABOVE = 200;
-        // Width changes closer together than this are one resize still going on (a window
-        // being dragged); measuring above is not repeated for each step of it.
-        private static final long RESIZE_PAUSE_MS = 400L;
+        // When the feed is laid out anew (a new view, a refresh, a new width), the cards the
+        // reader is about to see are built during that layout, so the first frame has them:
+        // this far above the post at the top of the screen and this far below, in screens.
+        private static final float MEASURE_BUILD_ABOVE = 0.5f;
+        private static final float MEASURE_BUILD_BELOW = 1.5f;
+        // A card that had to be built only to learn its height is let go again at once when it
+        // is more than this many posts from the reader's: a long timeline that is all new to
+        // the grid (X handing a restored one over) must not hold every card at the same time.
+        private static final int KEEP_MEASURED_WITHIN = 120;
+        // At a new width (the feed was turned or resized) no height on record applies. The
+        // built cards are measured again; the empty slots this many posts before and after
+        // the reader's have their cards built to be measured too. The ones further away take
+        // a stand-in until the reader comes near: building every card of a long timeline at
+        // once would stop the app for seconds.
+        private static final int EXACT_ABOVE = 12;
+        private static final int EXACT_BELOW = 48;
+
+        private static final java.util.Comparator<CardSlot> NEAREST_FIRST =
+                (a, b) -> Integer.compare(a.away, b.away);
 
         private final int gap;
         private List<PostCard> cards = Collections.emptyList();
         private final List<Integer> columnOf = new ArrayList<>();
         private int assignedColumns = -1;
-        // Where each card would go with the heights known so far; scratch for onMeasure.
+        // Where each card goes with the heights of this measure; scratch for onMeasure.
         private int[] tops = new int[0];
+        // The empty slots near the screen, nearest first; scratch for updateWindow.
+        private final List<CardSlot> waiting = new ArrayList<>();
         // The post at the top of the screen (null at the start of the feed), from the scroll
-        // container: cards are built around it when the grid is measured.
+        // container.
         private String focusPostId;
-        // The stretch of the grid the last measure built cards for, in the grid's coordinates.
-        private int builtFrom;
-        private int builtTo;
-        // The feed is racing past (see MagazineView.noteScrollStep): nothing is built meanwhile.
-        private boolean racing;
-        // The next measure builds the unmeasured cards above the reader (see MAX_MEASURED_ABOVE).
-        private boolean measureAbove = true;
+        // The next measure builds the cards around that post (see MEASURE_BUILD_ABOVE).
+        private boolean buildAroundFocus = true;
         private int measuredWidth = -1;
-        private long widthChangedAt;
+        // Where each column starts. All zero, except after stand-in heights above the reader
+        // gave way to real ones (see onMeasure), until the cards are next dealt anew.
+        private int[] columnBase = new int[0];
+        // The top of the screen in this grid's coordinates, from the scroll container.
+        private int viewportTop;
+        // How far measuring moved every card at once, down if positive (see onMeasure). The
+        // scroll container takes it and moves the feed along.
+        private int scrollShift;
+        // Off while the feed glides to its start (see settleTop): columns that gave way on the
+        // way there would not start level when it arrives.
+        private boolean givingWay = true;
         // Run when the grid is measured at a new width, before the cards are placed.
         private Runnable onWidthChanged;
         // Run after every layout of the cards; set by the scroll container (see updateWindow).
@@ -1152,8 +1240,26 @@ public final class MagazineFeed {
             focusPostId = postId;
         }
 
-        void setRacing(boolean racing) {
-            this.racing = racing;
+        /** The next layout has the cards around this post built (null: around the start). */
+        void buildAround(String postId) {
+            focusPostId = postId;
+            buildAroundFocus = true;
+        }
+
+        void setViewportTop(int top) {
+            viewportTop = top;
+        }
+
+        /** The reader scrolls by hand again (see givingWay). */
+        void readerTookOver() {
+            givingWay = true;
+        }
+
+        /** See scrollShift; zero from then on. */
+        int takeScrollShift() {
+            int shift = scrollShift;
+            scrollShift = 0;
+            return shift;
         }
 
         String postIdAt(int index) {
@@ -1227,7 +1333,8 @@ public final class MagazineFeed {
                 }
                 removeAllViews();
                 columnOf.clear();
-                measureAbove = true;
+                Arrays.fill(columnBase, 0);
+                buildAroundFocus = true;
                 for (PostCard card : next) {
                     CardSlot slot = card.postId == null ? null : kept.get(card.postId);
                     PostCard old = slot == null ? null : slot.card();
@@ -1276,19 +1383,22 @@ public final class MagazineFeed {
         }
 
         /**
-         * Builds the cards near the screen, lets go of the ones far from it, and does the same
-         * for pictures on a tighter window. Without this a long timeline kept every card view
-         * and every picture, and a feed that X re-created built and fetched all of them again at
-         * once, the ones on screen last. {@code visibleTop}/{@code visibleBottom}: the part of
-         * the grid on screen, in the grid's own coordinates. {@code build}: false while the feed
-         * races past, when only letting go is worth doing.
+         * Builds the cards near the screen that were let go, lets go of the ones far from it,
+         * and does the same for pictures on a tighter window. Without this a long timeline kept
+         * every card view and every picture, and a feed that X re-created built and fetched all
+         * of them again at once, the ones on screen last. Nothing moves in here: an empty slot
+         * is as tall as its card. {@code visibleTop}/{@code visibleBottom}: the part of the
+         * grid on screen, in the grid's own coordinates. {@code buildNanos}: how long cards may
+         * be built for this time; one is built whatever it says. Returns true when cards near
+         * the screen are still waiting.
          */
-        void updateWindow(int visibleTop, int visibleBottom, boolean build) {
+        boolean updateWindow(int visibleTop, int visibleBottom, long buildNanos) {
             int screen = Math.max(1, visibleBottom - visibleTop);
             int buildWithin = Math.round(screen * BUILD_WITHIN);
             int releaseBeyond = Math.round(screen * RELEASE_BEYOND);
             int picturesWithin = Math.round(screen * PICTURES_WITHIN);
             int picturesBeyond = Math.round(screen * PICTURES_BEYOND);
+            waiting.clear();
             for (int i = 0; i < getChildCount(); i++) {
                 CardSlot slot = slotAt(i);
                 // A slot not laid out yet has no place; it is looked at again after the layout.
@@ -1298,14 +1408,27 @@ public final class MagazineFeed {
                 int away = top > visibleBottom ? top - visibleBottom
                         : bottom < visibleTop ? visibleTop - bottom : 0;
                 if (away <= buildWithin) {
-                    if (build) slot.build(false);
-                } else if (away > releaseBeyond && !(top < builtTo && bottom > builtFrom)) {
-                    // Not what the last measure built on purpose, or it would build it again.
+                    if (!slot.built()) {
+                        slot.away = away;
+                        waiting.add(slot);
+                    }
+                } else if (away > releaseBeyond) {
                     slot.release();
                 }
                 if (away <= picturesWithin) slot.showPictures(true);
                 else if (away > picturesBeyond) slot.showPictures(false);
             }
+            if (waiting.isEmpty()) return false;
+            // The cards on screen first, then outwards.
+            Collections.sort(waiting, NEAREST_FIRST);
+            long deadline = System.nanoTime() + buildNanos;
+            int built = 0;
+            while (built < waiting.size() && (built == 0 || System.nanoTime() < deadline)) {
+                waiting.get(built++).build(false);
+            }
+            boolean more = built < waiting.size();
+            waiting.clear();
+            return more;
         }
 
         private int columnCount(int width) {
@@ -1320,11 +1443,11 @@ public final class MagazineFeed {
         }
 
         /** The column a post was dealt before at this column count, else the shortest one now. */
-        private static int deal(PostCard card, int columns, int[] bottoms) {
+        private static int deal(PostCard card, int columns, int[] nextTop) {
             String key = card.postId == null ? null : card.postId + '/' + columns;
             Integer dealt = key == null ? null : DEALT.get(key);
             if (dealt != null && dealt < columns) return dealt;
-            int column = shortest(bottoms);
+            int column = shortest(nextTop);
             if (key != null) DEALT.put(key, column);
             return column;
         }
@@ -1343,16 +1466,15 @@ public final class MagazineFeed {
                 columnOf.clear();
                 assignedColumns = columns;
             }
+            if (columnBase.length != columns) columnBase = new int[columns];
             int columnWidth = columnWidth(width, columns);
             int count = getChildCount();
-            int screen = Math.max(1, getResources().getDisplayMetrics().heightPixels);
             if (width != measuredWidth) {
                 if (measuredWidth > 0) {
                     // Rotation or resize: every card changes shape. The reader's post is put
                     // back at the top of the screen afterwards (the scroll container's part).
-                    long now = android.os.SystemClock.uptimeMillis();
-                    if (now - widthChangedAt > RESIZE_PAUSE_MS) measureAbove = true;
-                    widthChangedAt = now;
+                    buildAroundFocus = true;
+                    Arrays.fill(columnBase, 0);
                     if (onWidthChanged != null) onWidthChanged.run();
                 }
                 measuredWidth = width;
@@ -1361,62 +1483,84 @@ public final class MagazineFeed {
             int childWidthSpec = MeasureSpec.makeMeasureSpec(columnWidth, MeasureSpec.EXACTLY);
             int childHeightSpec = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
             if (tops.length < count) tops = new int[count + 64];
-            int[] bottoms = new int[columns];
+            // Where the next card of each column goes.
+            int[] nextTop = columnBase.clone();
             int focus = indexOfPost(focusPostId);
             if (focus >= count) focus = -1;
-            // The cards that are built are measured first: their heights are the real ones.
+
+            // Cards are placed by their real heights. A built card is measured; an empty slot
+            // has the height its card was measured at before, at this width. A post that has
+            // never been measured is built here and now to be measured, as every card was
+            // before there were slots, so a new post is never placed by a guess. The one
+            // exception is a new width, see EXACT_ABOVE. New cards are dealt here.
+            int reader = Math.max(focus, 0);
             for (int i = 0; i < count; i++) {
                 CardSlot slot = slotAt(i);
-                if (slot.built()) slot.measure(childWidthSpec, childHeightSpec);
+                // A stand-in this slot was given at an earlier measure; -1 for none.
+                int standIn = slot.standInAt(columnWidth);
+                boolean builtToMeasure = false;
+                if (!slot.built() && standIn < 0 && !slot.knowsHeightAt(columnWidth)) {
+                    boolean near = i >= reader - EXACT_ABOVE && i <= reader + EXACT_BELOW;
+                    if (near || !slot.guessHeightAt(columnWidth)) {
+                        slot.build(true);
+                        builtToMeasure = true;
+                    }
+                }
+                slot.measure(childWidthSpec, childHeightSpec);
+                if (builtToMeasure && Math.abs(i - reader) > KEEP_MEASURED_WITHIN) {
+                    slot.releaseWhileMeasuring();
+                }
+                if (i >= columnOf.size()) columnOf.add(deal(slot.card(), columns, nextTop));
+                int column = columnOf.get(i);
+                int grew = standIn < 0 || !slot.hasCard() ? 0 : slot.getMeasuredHeight() - standIn;
+                if (grew != 0 && slot.isLaidOut() && slot.getHeight() == standIn
+                        && slot.getBottom() <= viewportTop && canGiveWay(column, grew)) {
+                    // A card above the reader was built and its real height took the place of
+                    // the stand-in. Everything under it in its column would move, the cards on
+                    // screen with it. Instead the column gives way upwards: this card's top and
+                    // the cards above it move, out of sight, and nothing under it does.
+                    columnBase[column] -= grew;
+                    nextTop[column] -= grew;
+                }
+                tops[i] = nextTop[column];
+                nextTop[column] = tops[i] + slot.getMeasuredHeight() + gap;
             }
 
-            // The cards the reader is about to see are built here, so that they are there when
-            // this layout is drawn: around the post at the top of the screen, or the start of
-            // the feed. (Scrolling builds the rest as it goes, see updateWindow.) A card that
-            // is built gets its real height, which moves the cards after it, so what is near
-            // the reader is worked out again until nothing more needs building; twice is usual.
-            for (int round = 0; round < 3; round++) {
-                // Where every card goes with the heights known so far: measured ones for cards
-                // built at this width before, guesses for the rest. New cards are dealt here.
-                java.util.Arrays.fill(bottoms, 0);
-                for (int i = 0; i < count; i++) {
-                    CardSlot slot = slotAt(i);
-                    if (i >= columnOf.size()) columnOf.add(deal(slot.card(), columns, bottoms));
-                    int column = columnOf.get(i);
-                    tops[i] = bottoms[column] == 0 ? 0 : bottoms[column] + gap;
-                    bottoms[column] = tops[i] + slot.heightAt(columnWidth);
-                }
+            if (buildAroundFocus) {
+                // The cards the reader is about to see are built before this layout is drawn:
+                // around the post at the top of the screen, or the start of the feed. (The
+                // rest come back as the reader nears them, see updateWindow.)
+                buildAroundFocus = false;
+                int screen = Math.max(1, getResources().getDisplayMetrics().heightPixels);
                 int focusTop = focus < 0 ? 0 : tops[focus];
-                builtFrom = focusTop - Math.round(screen * MEASURE_BUILD_ABOVE);
-                builtTo = focusTop + Math.round(screen * MEASURE_BUILD_BELOW);
-                if (racing) break;
-                boolean builtAny = false;
+                int from = focusTop - Math.round(screen * MEASURE_BUILD_ABOVE);
+                int to = focusTop + Math.round(screen * MEASURE_BUILD_BELOW);
                 for (int i = 0; i < count; i++) {
                     CardSlot slot = slotAt(i);
-                    if (slot.built()) continue;
-                    boolean near = tops[i] < builtTo && tops[i] + slot.heightAt(columnWidth) > builtFrom;
-                    // Above the reader by place, in any column: a later post can sit higher
-                    // than the one at the top of the screen.
-                    boolean guessedAbove = measureAbove && focus >= 0 && tops[i] < focusTop
-                            && Math.abs(focus - i) <= MAX_MEASURED_ABOVE && !slot.measuredAt(columnWidth);
-                    if (!near && !guessedAbove) continue;
+                    if (slot.built() || tops[i] >= to || tops[i] + slot.getMeasuredHeight() <= from) continue;
                     slot.build(true);
                     slot.measure(childWidthSpec, childHeightSpec);
-                    builtAny = true;
                 }
-                if (!builtAny) break;
             }
-            if (!racing) measureAbove = false;
 
-            java.util.Arrays.fill(bottoms, 0);
+            // Columns that gave way start at different heights. The highest one is put at the
+            // top of the grid, which moves every card by the same amount.
+            int lowest = columnBase[0];
+            for (int base : columnBase) lowest = Math.min(lowest, base);
+            if (lowest != 0) {
+                for (int c = 0; c < columns; c++) columnBase[c] -= lowest;
+                scrollShift -= lowest;
+            }
+
+            int[] end = columnBase.clone();
             for (int i = 0; i < count; i++) {
-                CardSlot slot = slotAt(i);
-                slot.measure(childWidthSpec, childHeightSpec);
-                int column = columnOf.get(i);
-                bottoms[column] += (bottoms[column] == 0 ? 0 : gap) + slot.getMeasuredHeight();
+                end[columnOf.get(i)] += slotAt(i).getMeasuredHeight() + gap;
             }
             int tallest = 0;
-            for (int bottom : bottoms) tallest = Math.max(tallest, bottom);
+            for (int c = 0; c < columns; c++) {
+                // A column's cards end one gap before where its next card would go.
+                if (end[c] > columnBase[c]) tallest = Math.max(tallest, end[c] - gap);
+            }
             setMeasuredDimension(resolveSize(width, widthSpec), resolveSize(tallest, heightSpec));
         }
 
@@ -1426,6 +1570,7 @@ public final class MagazineFeed {
             int columns = columnCount(width);
             int columnWidth = columnWidth(width, columns);
             int[] nextTop = new int[columns];
+            for (int c = 0; c < columns && c < columnBase.length; c++) nextTop[c] = columnBase[c];
             for (int i = 0; i < getChildCount() && i < columnOf.size(); i++) {
                 View child = getChildAt(i);
                 int column = Math.min(columnOf.get(i), columns - 1);
@@ -1437,6 +1582,45 @@ public final class MagazineFeed {
             if (afterLayout != null) afterLayout.run();
         }
 
+        /**
+         * Whether a column may start {@code by} higher (see columnBase). Columns that gave way
+         * by different amounts start at different heights, which shows at the start of the
+         * feed; they are kept within a quarter of a screen of each other. Past that the card
+         * under a stand-in moves after all, with the cards under it.
+         */
+        private boolean canGiveWay(int column, int by) {
+            if (!givingWay) return false;
+            int lowest = Integer.MAX_VALUE;
+            int highest = Integer.MIN_VALUE;
+            for (int c = 0; c < columnBase.length; c++) {
+                int base = c == column ? columnBase[c] - by : columnBase[c];
+                lowest = Math.min(lowest, base);
+                highest = Math.max(highest, base);
+            }
+            return highest - lowest <= getResources().getDisplayMetrics().heightPixels / 4;
+        }
+
+        /**
+         * The reader is on the way to the start of the feed (Home again): whatever is unsettled
+         * there is settled now, while the feed races past and it does not show. Columns start
+         * level again and stay so until the reader scrolls by hand, and the first cards that
+         * only had a stand-in height are built to get their real one, so that nothing moves
+         * when the reader arrives.
+         */
+        void settleTop() {
+            givingWay = false;
+            boolean changed = false;
+            for (int base : columnBase) changed |= base != 0;
+            Arrays.fill(columnBase, 0);
+            for (int i = 0; i < getChildCount() && i <= EXACT_BELOW; i++) {
+                CardSlot slot = slotAt(i);
+                if (!slot.forgetStandIn()) continue;
+                slot.build(false);
+                changed = true;
+            }
+            if (changed) requestLayout();
+        }
+
         private static int shortest(int[] heights) {
             int best = 0;
             for (int i = 1; i < heights.length; i++) if (heights[i] < heights[best]) best = i;
@@ -1445,35 +1629,46 @@ public final class MagazineFeed {
     }
 
     /**
-     * A card's place in the grid. The card's view is only there while the card is near the
-     * screen; the rest of the time the slot is empty and just keeps the card's height. Every
-     * post keeping its card view made a long timeline slower the longer it got.
+     * A card's place in the grid. The card's view is only there while the card is within a few
+     * screens of the reader; the rest of the time the slot is empty and keeps the height the
+     * card was measured at. Every post keeping its card view made a long timeline slower the
+     * longer it got.
      */
     private static final class CardSlot extends ViewGroup {
         // Heights of cards measured this session, by post, content, width and text size. They
         // outlive the view: when X re-creates the feed, cards away from the screen are not
         // built again just to learn how tall they are.
         private static final android.util.LruCache<String, Integer> MEASURED = new android.util.LruCache<>(8000);
+        // Each card's latest measurement, at whatever width (the width in the high half, the
+        // height in the low one): what a stand-in height at another width is worked out from.
+        private static final android.util.LruCache<String, Long> LAST_MEASURED = new android.util.LruCache<>(8000);
         private static final android.graphics.Paint PLACEHOLDER = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
 
         private PostCard card;
         private CardRoot content;
-        // The card's height at heightWidth: measured from the built card, else a guess.
+        // The card's height at heightWidth, as measured from the built card (now, or earlier
+        // this session). While measured is false the card has never been built at that width,
+        // and height is a stand-in (see guessHeightAt) or -1.
         private int height = -1;
         private int heightWidth = -1;
         private boolean measured;
         private boolean picturesWanted;
+        // How far from the screen this slot is; scratch for MasonryGrid.updateWindow.
+        int away;
         // Building this card failed once; it stays an empty placeholder rather than be tried
         // (and fail) on every layout.
         private boolean unbuildable;
         private final int placeholderColor;
         private final float placeholderRadius;
+        // What a card that could not be built takes up.
+        private final int unbuildableHeight;
 
         CardSlot(Context context, PostCard card) {
             super(context);
             this.card = card;
             placeholderColor = Theme.surfaceContainer(context);
             placeholderRadius = Theme.dpToPx(context, CARD_RADIUS_DP);
+            unbuildableHeight = Theme.dpToPx(context, 96f);
             // The built card's shadow reaches a little past the slot.
             setClipChildren(false);
             setWillNotDraw(false);
@@ -1486,6 +1681,23 @@ public final class MagazineFeed {
         /** True when there is nothing (more) to build: the card is there, or it cannot be made. */
         boolean built() {
             return content != null || unbuildable;
+        }
+
+        boolean hasCard() {
+            return content != null;
+        }
+
+        /** The stand-in height this slot has at this width (see guessHeightAt), or -1 for none. */
+        int standInAt(int width) {
+            return !measured && heightWidth == width && height >= 0 ? height : -1;
+        }
+
+        /** Drops a stand-in height, so that the card is measured for real; false if there was none. */
+        boolean forgetStandIn() {
+            if (content != null || unbuildable || measured || height < 0) return false;
+            height = -1;
+            heightWidth = -1;
+            return true;
         }
 
         /**
@@ -1525,9 +1737,20 @@ public final class MagazineFeed {
             invalidate();
         }
 
-        /** Lets the built card go, if its height here is known for certain, so that nothing moves. */
+        /** Lets the built card go, once it has been measured here, so that nothing moves. */
         void release() {
             if (content != null && measured && heightWidth == getWidth()) drop();
+        }
+
+        /**
+         * For a card the grid built only to measure, while the grid is still being measured:
+         * the height stays, the view goes. No layout is asked for; one is running.
+         */
+        void releaseWhileMeasuring() {
+            if (content == null || !measured) return;
+            content.showPictures(false);
+            removeViewInLayout(content);
+            content = null;
         }
 
         /** The post left the timeline, or its card has to be made anew. */
@@ -1547,25 +1770,49 @@ public final class MagazineFeed {
             if (content != null) content.showPictures(show);
         }
 
-        /** The card's height at this width: the measured one if it ever was measured, else a guess. */
-        int heightAt(int width) {
-            if (heightWidth != width || height < 0) {
+        /**
+         * True when the card's real height at this width is on record: it is built and was
+         * measured at it, or was earlier this session.
+         */
+        boolean knowsHeightAt(int width) {
+            if (heightWidth != width) {
                 Integer known = card.postId == null ? null : MEASURED.get(key(width));
                 measured = known != null;
-                height = measured ? known : CardViews.estimateHeight(getContext(), card, width);
+                height = measured ? known : -1;
                 heightWidth = width;
             }
-            return height;
-        }
-
-        boolean measuredAt(int width) {
-            heightAt(width);
             return measured;
         }
 
+        /**
+         * For an empty slot whose card was measured this session, but not at this width (the
+         * feed was turned or resized): takes a stand-in height worked out from that one, until
+         * the card is built here. False when there is nothing to go by: a post that has never
+         * been measured gets no stand-in, it has to be built.
+         */
+        boolean guessHeightAt(int width) {
+            if (heightWidth == width && height >= 0) return true;
+            Long last = card.postId == null ? null : LAST_MEASURED.get(lastKey());
+            if (last == null) return false;
+            int fromWidth = (int) (last >> 32);
+            int fromHeight = (int) (last & 0xFFFFFFFFL);
+            if (fromWidth <= 0 || fromHeight <= 0) return false;
+            height = CardViews.guessHeight(getContext(), card, fromWidth, fromHeight, width);
+            heightWidth = width;
+            measured = false;
+            // Not a size this slot was measured with before: no measurement on record is reused.
+            forceLayout();
+            return true;
+        }
+
         private String key(int width) {
+            return width + "@" + lastKey();
+        }
+
+        // The same card, whatever its width: same post, same content, same text size.
+        private String lastKey() {
             int textScale = Math.round(getResources().getDisplayMetrics().scaledDensity * 100f);
-            return card.postId + "@" + width + "@" + textScale + "@" + card.contentKey.hashCode();
+            return card.postId + "@" + textScale + "@" + card.contentKey.hashCode();
         }
 
         @Override
@@ -1579,22 +1826,36 @@ public final class MagazineFeed {
                     height = real;
                     heightWidth = width;
                     measured = true;
-                    if (card.postId != null) MEASURED.put(key(width), real);
+                    if (card.postId != null) {
+                        MEASURED.put(key(width), real);
+                        LAST_MEASURED.put(lastKey(), ((long) width << 32) | real);
+                    }
                 }
+                setMeasuredDimension(width, real);
+                return;
             }
-            setMeasuredDimension(width, heightAt(width));
+            // Empty: as tall as the card was when it was last built at this width, or the
+            // stand-in the grid asked for. The grid sees to one or the other before it
+            // measures a slot, so having neither means the card could not be built.
+            knowsHeightAt(width);
+            setMeasuredDimension(width, height >= 0 ? height : unbuildableHeight);
         }
 
         @Override
         protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
-            if (content != null) content.layout(0, 0, right - left, bottom - top);
+            if (content == null) return;
+            boolean first = !content.isLaidOut();
+            content.layout(0, 0, right - left, bottom - top);
+            // The placeholder drawn until now (see onDraw) is no longer wanted.
+            if (first) invalidate();
         }
 
-        // An empty slot shows the shape of its card. It is only seen when the feed moves faster
-        // than cards are built: the glide to the top from deep in a long timeline.
+        // An empty slot shows the shape of its card, as does one whose card has not been laid
+        // out yet. It is only seen when the feed moves faster than cards come back: going a
+        // long way back up quickly, or the glide to the top from deep in a long timeline.
         @Override
         protected void onDraw(android.graphics.Canvas canvas) {
-            if (content != null) return;
+            if (content != null && content.isLaidOut()) return;
             PLACEHOLDER.setColor(placeholderColor);
             canvas.drawRoundRect(0f, 0f, getWidth(), getHeight(), placeholderRadius, placeholderRadius, PLACEHOLDER);
         }
@@ -1783,46 +2044,53 @@ public final class MagazineFeed {
         }
 
         /**
-         * Roughly how tall a grid card will be at this width, for a card that has never been
-         * built at it (see CardSlot). It follows build() part by part. Only cards away from the
-         * screen are sized this way, and the real height takes over as soon as the card is
-         * built, so this has to be plausible, not right: it keeps the feed's length and the
-         * columns about where they will end up.
+         * About how tall a grid card is at {@code width}, going by how tall it really was at
+         * {@code fromWidth}. Only for a card away from the reader after the feed was turned or
+         * resized (see CardSlot.guessHeightAt); the real height takes over when the card is
+         * built. It is the real height, changed by what build() makes differently at another
+         * width: pictures keep their shape, so their part is worked out, and the text takes
+         * more or fewer lines. The fixed parts stay as they were measured.
          */
-        static int estimateHeight(Context context, PostCard card, int width) {
+        static int guessHeight(Context context, PostCard card, int fromWidth, int fromHeight, int width) {
+            if (fromWidth == width || fromWidth <= 0 || width <= 0) return Math.max(1, fromHeight);
             android.util.DisplayMetrics metrics = context.getResources().getDisplayMetrics();
             float dp = metrics.density;
             float sp = metrics.scaledDensity;
-            float inner = Math.max(1f, width - 28f * dp);
-            float height = (14f + 40f + 6f + 40f + 6f) * dp;        // padding, author, action row
-            if (card.repostedBy != null) height += 20f * dp + lineHeight(13f * sp, 1f);
-            if (card.replyingTo != null) height += 8f * dp + lineHeight(13f * sp, 1f);
-            if (card.coverText == null && !card.media.isEmpty()) {
-                height += card.sensitiveMedia
-                        ? 80f * dp + lineHeight(14f * sp, 1f)
-                        : mediaHeight(card.media, width, 2f * dp);
+            float height = fromHeight
+                    + picturesHeight(card, width, dp) - picturesHeight(card, fromWidth, dp)
+                    + textHeight(card, width, dp, sp) - textHeight(card, fromWidth, dp, sp);
+            // Never less than a card's fixed parts take.
+            return Math.max(Math.round(80f * dp), Math.round(height));
+        }
+
+        /** The height build() gives a grid card's pictures at this width, its own and a quote's. */
+        private static float picturesHeight(PostCard card, int width, float dp) {
+            if (card.coverText != null) return 0f;
+            float height = 0f;
+            if (!card.media.isEmpty() && !card.sensitiveMedia) height += mediaHeight(card.media, width, 2f * dp);
+            if (card.quote != null && !card.quote.media.isEmpty()) {
+                height += mediaHeight(card.quote.media.subList(0, 1), Math.max(1f, width - 28f * dp), 2f * dp);
             }
+            return height;
+        }
+
+        /** About the height of a grid card's text at this width, its own and a quote's. */
+        private static float textHeight(PostCard card, int width, float dp, float sp) {
+            float inner = Math.max(1f, width - 28f * dp);
+            float height = 0f;
             String shown = card.coverText != null ? card.coverText : card.text;
             if (shown != null) {
                 int most = card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA;
-                height += 8f * dp + Math.min(most, lines(shown, inner, 16f * sp)) * lineHeight(16f * sp, 1.2f);
+                height += Math.min(most, lines(shown, inner, 16f * sp)) * 16f * sp * 1.17f * 1.2f;
             }
-            if (card.quote != null && card.coverText == null) {
+            if (card.quote != null && card.coverText == null && card.quote.text != null) {
                 float quoteInner = Math.max(1f, inner - 24f * dp);
-                height += (12f + 20f) * dp + lineHeight(13.5f * sp, 1f);
-                if (card.quote.text != null) {
-                    height += 4f * dp + Math.min(5, lines(card.quote.text, quoteInner, 14f * sp)) * lineHeight(14f * sp, 1f);
-                }
-                if (!card.quote.media.isEmpty()) height += mediaHeight(card.quote.media.subList(0, 1), inner, 2f * dp);
+                height += Math.min(5, lines(card.quote.text, quoteInner, 14f * sp)) * 14f * sp * 1.17f;
             }
-            return Math.max(1, Math.round(height));
+            return height;
         }
 
-        // A line of text is about 1.17 times its size tall, times the view's line spacing.
-        private static float lineHeight(float textSize, float spacing) {
-            return textSize * 1.17f * spacing;
-        }
-
+        // A line of text is about 1.17 times its size tall (times the view's line spacing).
         // Latin letters average about half their size in width; CJK characters are a full one.
         private static int lines(String text, float width, float textSize) {
             int lines = 0;
