@@ -42,6 +42,15 @@ post's id). X's own action bar passes the row's `ContextualPost` as it is.
 patch-side fill are removed; `resolvedNewXPostModels().contextualRepostedPostField` is no longer
 used by this patch.
 
+## Also reported: "the like button has a big hit box when clicked"
+
+Classification: runtime behavior (layout), nothing to do with resolvers. Reply, repost and like
+were each stretched over a third of the action row (layout weight 1 on the button itself), so a
+tap anywhere in that third counted as the button, and the theme's borderless ripple spread in a
+circle as wide as the stretched button, over the neighbouring buttons and the text. Each button
+is now as wide as its icon and count inside an equal, inert share of the row, with a pill-shaped
+ripple bounded by the button (`bd12fdf`).
+
 ## Validation
 
 Read from the 12.40.1 dex files with androguard: `ContextualPost.toString` (label to field
