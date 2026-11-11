@@ -1222,9 +1222,11 @@ public final class MagazineFeed {
         // How far measuring moved every card at once, down if positive (see onMeasure). The
         // scroll container takes it and moves the feed along.
         private int scrollShift;
-        // Off while the feed glides to its start (see settleTop): columns that gave way on the
-        // way there would not start level when it arrives.
-        private boolean givingWay = true;
+        // The feed is gliding to its start, or has arrived there and the reader has not
+        // scrolled since (see settleTop). No column gives way meanwhile, or the columns would
+        // not start level on arrival; and the cards at the start count as on screen, so they
+        // and their pictures are there when the feed arrives.
+        private boolean headedToStart;
         // Run when the grid is measured at a new width, before the cards are placed.
         private Runnable onWidthChanged;
         // Run after every layout of the cards; set by the scroll container (see updateWindow).
@@ -1250,9 +1252,9 @@ public final class MagazineFeed {
             viewportTop = top;
         }
 
-        /** The reader scrolls by hand again (see givingWay). */
+        /** The reader scrolls by hand again (see headedToStart). */
         void readerTookOver() {
-            givingWay = true;
+            headedToStart = false;
         }
 
         /** See scrollShift; zero from then on. */
@@ -1390,7 +1392,7 @@ public final class MagazineFeed {
          * is as tall as its card. {@code visibleTop}/{@code visibleBottom}: the part of the
          * grid on screen, in the grid's own coordinates. {@code buildNanos}: how long cards may
          * be built for this time; one is built whatever it says. Returns true when cards near
-         * the screen are still waiting.
+         * the screen are still waiting. Cards as near as each other are built in timeline order.
          */
         boolean updateWindow(int visibleTop, int visibleBottom, long buildNanos) {
             int screen = Math.max(1, visibleBottom - visibleTop);
@@ -1407,6 +1409,8 @@ public final class MagazineFeed {
                 int bottom = slot.getBottom();
                 int away = top > visibleBottom ? top - visibleBottom
                         : bottom < visibleTop ? visibleTop - bottom : 0;
+                // On the way to the start of the feed, its first screen counts as on screen.
+                if (headedToStart) away = Math.min(away, Math.max(0, top - screen));
                 if (away <= buildWithin) {
                     if (!slot.built()) {
                         slot.away = away;
@@ -1589,7 +1593,7 @@ public final class MagazineFeed {
          * under a stand-in moves after all, with the cards under it.
          */
         private boolean canGiveWay(int column, int by) {
-            if (!givingWay) return false;
+            if (headedToStart) return false;
             int lowest = Integer.MAX_VALUE;
             int highest = Integer.MIN_VALUE;
             for (int c = 0; c < columnBase.length; c++) {
@@ -1608,7 +1612,7 @@ public final class MagazineFeed {
          * when the reader arrives.
          */
         void settleTop() {
-            givingWay = false;
+            headedToStart = true;
             boolean changed = false;
             for (int base : columnBase) changed |= base != 0;
             Arrays.fill(columnBase, 0);
