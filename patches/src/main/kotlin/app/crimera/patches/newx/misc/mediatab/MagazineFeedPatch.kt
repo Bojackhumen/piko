@@ -205,17 +205,11 @@ private fun patchCardActions(actions: ResolvedPostActions) {
         returnObject(0)
     }
 
-    // repostedOf(contextualPost): the reposted original, so a repost card acts on the post it shows.
-    val repostedField = resolvedNewXPostModels().contextualRepostedPostField
-    replaceBridge("repostedOf", listOf(OBJECT), OBJECT, totalRegisters = 2) { p0 ->
-        move(0, p0, OBJECT)
-        checkCast(0, contextualPost)
-        iget(0, 0, repostedField)
-        returnObject(0)
-    }
-
     // likePost/unlikePost/repostPost/bookmarkPost/unbookmarkPost(service, post): X's own dispatcher
     // call, reproducing X's exact scribe map and mask per action (post id always left to default).
+    // The post is always the row's ContextualPost, also on a repost row: the dispatcher reads the
+    // target id from the ContextualPost's own "shown post" (rePostedPost ?: canonicalPost). The
+    // reposted post is a different class (RePostedPost) and must not be passed here.
     CARD_ACTIONS.forEach { action ->
         replaceBridge(action.bridge, listOf(OBJECT, OBJECT), "V", totalRegisters = 9) { p0 ->
             move(0, p0, OBJECT)

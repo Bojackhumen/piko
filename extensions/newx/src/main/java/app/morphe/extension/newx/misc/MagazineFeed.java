@@ -140,10 +140,6 @@ public final class MagazineFeed {
         throw new IllegalStateException("Piko 2.0 postResultOf bridge was not patched");
     }
 
-    private static Object repostedOf(Object contextualPost) {
-        throw new IllegalStateException("Piko 2.0 repostedOf bridge was not patched");
-    }
-
     private static void likePost(Object service, Object post) {
         throw new IllegalStateException("Piko 2.0 likePost bridge was not patched");
     }
@@ -192,16 +188,13 @@ public final class MagazineFeed {
             // X's newest copy of the post: this card may have been built before X re-sent it.
             Object item = freshCard(card).item;
             if (item == null) return false;
+            // The row's own post, also for a repost: X's service acts on the post the row shows.
+            // (Its ContextualPost keeps "rePostedPost ?: canonicalPost" as the post actions go
+            // to, and the service reads the id from there.) The reposted post itself is a
+            // RePostedPost, not a ContextualPost; handing that over failed the bridge's cast,
+            // so every repost card opened the post instead of acting in place.
             Object post = postResultOf(item);
             if (post == null) return false;
-            if (card.repostedBy != null) {
-                // A repost card shows the original post; act on that one.
-                try {
-                    Object original = repostedOf(post);
-                    if (original != null) post = original;
-                } catch (RuntimeException ignored) {
-                }
-            }
             switch (action) {
                 case LIKE -> likePost(service, post);
                 case UNLIKE -> unlikePost(service, post);
@@ -387,7 +380,7 @@ public final class MagazineFeed {
 
         FrameLayout scrim = new FrameLayout(activity);
         scrim.setOnClickListener(view -> dialog.dismiss());
-        scrim.setContentDescription("Close");
+        scrim.setContentDescription(Labels.of(activity, "Close", "close"));
         scrim.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
             @Override
             public void onViewAttachedToWindow(View view) {
@@ -419,7 +412,7 @@ public final class MagazineFeed {
 
         TextView close = CardViews.text(activity, "\u2715", 18f, Color.WHITE);
         close.setGravity(Gravity.CENTER);
-        close.setContentDescription("Close");
+        close.setContentDescription(Labels.of(activity, "Close", "close"));
         GradientDrawable closeBackground = new GradientDrawable();
         closeBackground.setShape(GradientDrawable.OVAL);
         closeBackground.setColor(0x66000000);
@@ -435,7 +428,8 @@ public final class MagazineFeed {
         column.addView(enlarged, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView openFull = CardViews.text(activity, "Open full post \u00B7 replies", 15f, Theme.onPrimaryAccent(activity));
+        TextView openFull = CardViews.text(activity,
+                Labels.of(activity, "Open full post \u00B7 replies", "view_tweet_text"), 15f, Theme.onPrimaryAccent(activity));
         CardViews.bold(openFull);
         openFull.setGravity(Gravity.CENTER);
         int buttonPadding = Theme.dpToPx(activity, 12f);
@@ -521,7 +515,175 @@ public final class MagazineFeed {
             return;
         }
         // Android 13 and later show their own "copied" preview; a toast on top would say it twice.
-        if (android.os.Build.VERSION.SDK_INT < 33) Toast.makeText(context, confirmation, Toast.LENGTH_SHORT).show();
+        if (android.os.Build.VERSION.SDK_INT < 33) {
+            Toast.makeText(context, Labels.of(context, confirmation, "copied_to_clipboard"), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ---------- Labels in X's own words ----------
+
+    /**
+     * Card labels in the app's language. In English they are the words written here. In any
+     * other language they are X's own strings: X ships each of these, translated, under the
+     * resource name given beside it (names and translations read from 12.40.1's resources). A
+     * name a later X no longer has falls back to the English. Main thread only.
+     */
+    private static final class Labels {
+        private static final java.util.Map<String, String> found = new java.util.HashMap<>();
+        private static java.util.Locale foundFor;
+
+        private Labels() {
+        }
+
+        static boolean english(Context context) {
+            try {
+                java.util.Locale locale = context.getResources().getConfiguration().getLocales().get(0);
+                return locale == null || "en".equals(locale.getLanguage());
+            } catch (RuntimeException e) {
+                return true;
+            }
+        }
+
+        static String of(Context context, String english, String name) {
+            try {
+                android.content.res.Resources resources = context.getResources();
+                java.util.Locale locale = resources.getConfiguration().getLocales().get(0);
+                if (locale == null || "en".equals(locale.getLanguage())) return english;
+                if (!locale.equals(foundFor)) {
+                    found.clear();
+                    foundFor = locale;
+                }
+                // "" stands for a name X does not have: the English differs between callers.
+                String label = found.get(name);
+                if (label == null) {
+                    int id = resources.getIdentifier(name, "string", context.getPackageName());
+                    String value = id == 0 ? null : resources.getString(id);
+                    label = value == null || value.trim().isEmpty() ? "" : value;
+                    found.put(name, label);
+                }
+                return label.isEmpty() ? english : label;
+            } catch (RuntimeException e) {
+                return english;
+            }
+        }
+
+        /** A label with one value in it, such as "%s reposted". */
+        static String with(Context context, String english, String name, String value) {
+            try {
+                return String.format(of(context, english, name), value);
+            } catch (RuntimeException e) {
+                return String.format(english, value);
+            }
+        }
+    }
+
+    // ---------- Links in a card's text ----------
+
+    /** A tappable stretch of a card's text: a link, an @mention, a #hashtag or a $cashtag. */
+    private static final class TextLink {
+        final int start;
+        final int end;
+        final String url;
+
+        TextLink(int start, int end, String url) {
+            this.start = start;
+            this.end = end;
+            this.url = url;
+        }
+    }
+
+    /**
+     * Follows a link from a card's text. X's own addresses (profiles, hashtags, searches, other
+     * posts) open inside X; anything else goes to the browser, as a link in a post does.
+     */
+    private static void openLink(Context context, String url) {
+        if (url == null) return;
+        Uri uri = Uri.parse(url);
+        String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(java.util.Locale.ROOT);
+        if (host.equals("x.com") || host.endsWith(".x.com")
+                || host.equals("twitter.com") || host.endsWith(".twitter.com")) {
+            openInX(context, url);
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+        if (!(context instanceof Activity)) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            context.startActivity(intent);
+        } catch (RuntimeException e) {
+            NewXLogger.printException(() -> LOG_PREFIX + "could not open " + url, e);
+        }
+    }
+
+    private static final class LinkSpan extends android.text.style.ClickableSpan {
+        private final String url;
+        private final int color;
+
+        LinkSpan(String url, int color) {
+            this.url = url;
+            this.color = color;
+        }
+
+        @Override
+        public void onClick(View widget) {
+            openLink(widget.getContext(), url);
+        }
+
+        @Override
+        public void updateDrawState(android.text.TextPaint paint) {
+            paint.setColor(color);
+            paint.setUnderlineText(false);
+        }
+    }
+
+    /** The link under a touch on a text view, or null when the touch is on plain text or beside it. */
+    private static android.text.style.ClickableSpan linkAt(TextView view, MotionEvent event) {
+        CharSequence shown = view.getText();
+        android.text.Layout layout = view.getLayout();
+        if (!(shown instanceof android.text.Spanned spanned) || layout == null) return null;
+        float x = event.getX() - view.getTotalPaddingLeft() + view.getScrollX();
+        float y = event.getY() - view.getTotalPaddingTop() + view.getScrollY();
+        if (y < 0 || y >= layout.getHeight()) return null;
+        int line = layout.getLineForVertical((int) y);
+        if (x < layout.getLineLeft(line) || x > layout.getLineRight(line)) return null;
+        int offset = layout.getOffsetForHorizontal(line, x);
+        android.text.style.ClickableSpan[] links =
+                spanned.getSpans(offset, offset, android.text.style.ClickableSpan.class);
+        return links.length == 0 ? null : links[0];
+    }
+
+    /**
+     * Marks the card's links, @mentions and #hashtags in its text and makes them tappable. Only
+     * a touch that starts on one is taken; any other touch goes on as before, to the card (which
+     * pops out) or, in the enlarged card, to text selection. A movement method would make the
+     * whole text swallow every touch.
+     */
+    private static void showLinks(TextView view, PostCard card) {
+        if (card.text == null || card.links.isEmpty()) return;
+        android.text.SpannableString marked = new android.text.SpannableString(card.text);
+        int color = Theme.primaryAccent(view.getContext());
+        for (TextLink link : card.links) {
+            if (link.end > marked.length()) continue;
+            marked.setSpan(new LinkSpan(link.url, color), link.start, link.end,
+                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        view.setText(marked);
+        android.text.style.ClickableSpan[] pressed = new android.text.style.ClickableSpan[1];
+        view.setOnTouchListener((touched, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                pressed[0] = linkAt(view, event);
+                return pressed[0] != null;
+            }
+            if (pressed[0] == null) return false;
+            if (action == MotionEvent.ACTION_UP) {
+                android.text.style.ClickableSpan link = pressed[0];
+                pressed[0] = null;
+                if (linkAt(view, event) == link) link.onClick(view);
+            } else if (action == MotionEvent.ACTION_CANCEL) {
+                pressed[0] = null;
+            }
+            return true;
+        });
     }
 
     // ---------- Scroll container ----------
@@ -530,11 +692,33 @@ public final class MagazineFeed {
         // One id per process so recreated AndroidView instances share saved scroll state.
         private static final int VIEW_STATE_ID = View.generateViewId();
 
-        // Where the reader was, kept across view recreation (leaving for a post and coming back
-        // can rebuild the AndroidView) and across X re-sending the timeline: the post at the top
-        // of the screen and how far it was scrolled past.
-        private static String anchorPostId;
-        private static int anchorOffset;
+        /**
+         * Where the reader was in one timeline: the post at the top of the screen, how far it
+         * was scrolled past, and the posts after it. Kept across view recreation (leaving for a
+         * post and coming back can rebuild the AndroidView) and across X re-sending the
+         * timeline. For You and Following each have their own; a single shared one made the
+         * timeline read second take over the first one's place.
+         */
+        private static final class Anchor {
+            final String postId;
+            // Tell timelines apart: both can hold the same post, but not with the same posts after it.
+            final List<String> following;
+            int offset;
+
+            Anchor(String postId, List<String> following, int offset) {
+                this.postId = postId;
+                this.following = following;
+                this.offset = offset;
+            }
+        }
+
+        // Most recent first, one per timeline the reader has scrolled. Main thread only.
+        private static final List<Anchor> anchors = new ArrayList<>();
+        private static final int MAX_ANCHORS = 6;
+        private static final int ANCHOR_FOLLOWING = 4;
+
+        // This view's own place (also in the list above); null at the top of the timeline.
+        private Anchor anchor;
 
         private final MasonryGrid grid;
         private final LoadingIndicatorView loadingIndicator;
@@ -607,7 +791,7 @@ public final class MagazineFeed {
 
             addView(content, new NestedScrollView.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-            restorePending = anchorPostId != null;
+            restorePending = !anchors.isEmpty();
             setItems(items);
         }
 
@@ -624,29 +808,76 @@ public final class MagazineFeed {
                 }
             }
             if (bestIndex < 0) {
-                if (top == 0) anchorPostId = null;
+                if (top == 0) forgetAnchor();
                 return;
             }
-            anchorPostId = grid.postIdAt(bestIndex);
-            anchorOffset = top - bestTop;
+            String postId = grid.postIdAt(bestIndex);
+            if (postId == null) return;
+            if (anchor != null && postId.equals(anchor.postId)) {
+                anchor.offset = top - bestTop;
+            } else {
+                anchors.remove(anchor);
+                anchor = new Anchor(postId, grid.postIdsAfter(bestIndex, ANCHOR_FOLLOWING), top - bestTop);
+            }
+            // The timeline being read is the first one looked at when a view comes back.
+            if (anchors.isEmpty() || anchors.get(0) != anchor) {
+                anchors.remove(anchor);
+                anchors.add(0, anchor);
+                while (anchors.size() > MAX_ANCHORS) anchors.remove(anchors.size() - 1);
+            }
+        }
+
+        private void forgetAnchor() {
+            anchors.remove(anchor);
+            anchor = null;
+        }
+
+        /**
+         * For a view that has no place of its own yet (X re-created it): the remembered place
+         * that belongs to this timeline. That is the one whose post is here with most of the
+         * same posts after it; the most recent one wins a tie. A post that is here without any
+         * of the posts that followed it is another timeline's place (a timeline still at its
+         * top has none of its own), so it is not taken.
+         */
+        private Anchor findAnchor() {
+            Anchor best = null;
+            int bestScore = -1;
+            for (Anchor candidate : anchors) {
+                int index = grid.indexOfPost(candidate.postId);
+                if (index < 0) continue;
+                int score = grid.countAfter(index, candidate.following);
+                if (score == 0 && !candidate.following.isEmpty()) continue;
+                if (score > bestScore) {
+                    best = candidate;
+                    bestScore = score;
+                }
+            }
+            return best;
         }
 
         /** After the cards are laid out, puts the remembered post back at the top of the screen. */
         private void restoreAnchorAfterLayout() {
-            if (anchorPostId == null) {
+            if (grid.isEmpty()) {
+                // No posts to find the place among yet; tried again when they arrive.
+                restorePending = anchor != null || !anchors.isEmpty();
+                return;
+            }
+            if (anchor == null) anchor = findAnchor();
+            if (anchor == null) {
                 restorePending = false;
                 return;
             }
             restorePending = true;
+            Anchor target = anchor;
             getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
                 @Override
                 public void onGlobalLayout() {
                     getViewTreeObserver().removeOnGlobalLayoutListener(this);
-                    int index = grid.indexOfPost(anchorPostId);
+                    int index = grid.indexOfPost(target.postId);
                     if (index >= 0) {
-                        int target = grid.getTop() + grid.getChildAt(index).getTop() + anchorOffset;
-                        scrollTo(0, Math.max(0, target));
-                        log("restored position at post " + anchorPostId);
+                        int y = grid.getTop() + grid.getChildAt(index).getTop() + target.offset;
+                        scrollTo(0, Math.max(0, y));
+                        log("restored position at post " + target.postId);
                     }
                     restorePending = false;
                 }
@@ -659,7 +890,7 @@ public final class MagazineFeed {
          * posts. The refresh that follows lands at the top, since the anchor is cleared here.
          */
         void onReselected() {
-            anchorPostId = null;
+            forgetAnchor();
             restorePending = false;
             if (getScrollY() > 0) {
                 glideToTop();
@@ -822,6 +1053,30 @@ public final class MagazineFeed {
             if (postId == null) return -1;
             for (int i = 0; i < cards.size(); i++) if (postId.equals(cards.get(i).postId)) return i;
             return -1;
+        }
+
+        boolean isEmpty() {
+            return cards.isEmpty();
+        }
+
+        /** The ids of up to {@code count} posts that come after the one at {@code index}. */
+        List<String> postIdsAfter(int index, int count) {
+            List<String> ids = new ArrayList<>(count);
+            for (int i = index + 1; i < cards.size() && ids.size() < count; i++) {
+                String id = cards.get(i).postId;
+                if (id != null) ids.add(id);
+            }
+            return ids;
+        }
+
+        /** How many of {@code ids} are among the posts shortly after the one at {@code index}. */
+        int countAfter(int index, List<String> ids) {
+            int found = 0;
+            int end = Math.min(cards.size(), index + 1 + ids.size() * 3);
+            for (int i = index + 1; i < end; i++) {
+                if (ids.contains(cards.get(i).postId)) found++;
+            }
+            return found;
         }
 
         /** Redraws this post's cards' action rows with what they should show now (see shownEngagement). */
@@ -1024,7 +1279,7 @@ public final class MagazineFeed {
                 body.addView(actions(context, card, Theme.secondaryText(context)), index);
             }
             View line = cardRoot.findViewWithTag(BYLINE_TAG);
-            String byline = byline(card);
+            String byline = byline(context, card);
             if (line instanceof TextView text && byline != null) text.setText(byline);
             cardRoot.setContentDescription(card.describe());
             // Keep the card tap (focus view) pointed at the fresh card.
@@ -1089,7 +1344,8 @@ public final class MagazineFeed {
             root.setContentDescription(card.describe());
 
             if (card.repostedBy != null) {
-                TextView contextLine = text(context, "\u21BB " + card.repostedBy + " reposted", 13f, muted);
+                TextView contextLine = text(context,
+                        "\u21BB " + Labels.with(context, "%s reposted", "reposted_by", card.repostedBy), 13f, muted);
                 bold(contextLine);
                 contextLine.setPadding(pad, pad - Theme.dpToPx(context, 2f), pad, Theme.dpToPx(context, 8f));
                 root.addView(contextLine);
@@ -1108,7 +1364,8 @@ public final class MagazineFeed {
             body.setPadding(pad, pad, pad, Theme.dpToPx(context, 6f));
 
             if (card.replyingTo != null) {
-                TextView replying = text(context, "\u21A9 Replying to @" + card.replyingTo, 13f, muted);
+                TextView replying = text(context, "\u21A9 " + Labels.with(context, "Replying to %s",
+                        "reply_context_to_someone", "@" + card.replyingTo), 13f, muted);
                 replying.setOnClickListener(view -> openInX(context, profileLink(card.replyingTo)));
                 replying.setPadding(0, 0, 0, Theme.dpToPx(context, 8f));
                 body.addView(replying);
@@ -1122,6 +1379,7 @@ public final class MagazineFeed {
             if (bodyText != null) {
                 TextView text = text(context, bodyText, focal ? 19f : 16f, card.coverText != null ? muted : ink);
                 text.setLineSpacing(0f, focal ? 1.25f : 1.2f);
+                if (card.coverText == null) showLinks(text, card);
                 if (!focal) {
                     text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
                     text.setEllipsize(TextUtils.TruncateAt.END);
@@ -1198,7 +1456,7 @@ public final class MagazineFeed {
                 name.setEllipsize(TextUtils.TruncateAt.END);
                 who.addView(name);
             }
-            String sub = byline(card);
+            String sub = byline(context, card);
             if (sub != null) {
                 TextView handle = text(context, sub, 13f, muted);
                 handle.setSingleLine(true);
@@ -1208,7 +1466,8 @@ public final class MagazineFeed {
             }
             head.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-            View more = iconButton(context, "More", muted, null, "\u22EF", "ic_vector_overflow", "ic_vector_more");
+            View more = iconButton(context, Labels.of(context, "More", "xchat_more"), muted, null,
+                    "\u22EF", "ic_vector_overflow", "ic_vector_more");
             more.setTag(MORE_TAG);
             more.setOnClickListener(view -> showMoreMenu(view, card));
             head.addView(more);
@@ -1216,21 +1475,23 @@ public final class MagazineFeed {
         }
 
         /** "@handle \u00B7 5m \u00B7 1.2K views", worked out when it is shown so the age keeps up. */
-        private static String byline(PostCard card) {
+        private static String byline(Context context, PostCard card) {
             String views = formatCount(card.engagement.views);
             return joinNonNull(joinNonNull(card.handle == null ? null : "@" + card.handle, card.age()),
-                    views == null ? null : views + " views");
+                    views == null ? null : views + " " + Labels.of(context, "views", "view_count"));
         }
 
         private static void showMoreMenu(View anchor, PostCard card) {
             Context context = anchor.getContext();
             PopupMenu menu = new PopupMenu(context, anchor);
-            menu.getMenu().add(0, 1, 0, "Open post");
-            menu.getMenu().add(0, 2, 1, "Copy link");
+            menu.getMenu().add(0, 1, 0, Labels.of(context, "Open post", "view_tweet_text"));
+            menu.getMenu().add(0, 2, 1, Labels.of(context, "Copy link", "copy_link"));
             // Not for a post X covers with a warning: the card does not show that text either.
             if (card.text != null && card.coverText == null) menu.getMenu().add(0, 5, 2, "Copy text");
-            menu.getMenu().add(0, 3, 3, "Share via\u2026");
-            if (card.handle != null) menu.getMenu().add(0, 4, 4, "View @" + card.handle);
+            menu.getMenu().add(0, 3, 3, Labels.of(context, "Share via\u2026", "room_settings_system_share_via"));
+            if (card.handle != null) {
+                menu.getMenu().add(0, 4, 4, (Labels.english(context) ? "View @" : "@") + card.handle);
+            }
             menu.setOnMenuItemClickListener(item -> {
                 switch (item.getItemId()) {
                     case 1 -> openInX(context, card.postLink());
@@ -1255,8 +1516,10 @@ public final class MagazineFeed {
         private static void showRepostMenu(View anchor, PostCard card, ToggleState state, Runnable paint) {
             Context context = anchor.getContext();
             PopupMenu menu = new PopupMenu(context, anchor);
-            menu.getMenu().add(0, 1, 0, state.active ? "Undo repost" : "Repost");
-            menu.getMenu().add(0, 2, 1, "Quote");
+            menu.getMenu().add(0, 1, 0, state.active
+                    ? Labels.of(context, "Undo repost", "tweets_undo_retweet_vertical")
+                    : Labels.of(context, "Repost", "button_action_retweet"));
+            menu.getMenu().add(0, 2, 1, Labels.of(context, "Quote", "quote_tweet"));
             menu.setOnMenuItemClickListener(item -> {
                 switch (item.getItemId()) {
                     case 1 -> {
@@ -1295,15 +1558,23 @@ public final class MagazineFeed {
             Engagement e = shownEngagement(card);
             int accent = Theme.primaryAccent(context);
 
-            View reply = iconButton(context, "Reply", muted, e.replies, "\u21A9",
+            String replyLabel = Labels.of(context, "Reply", "button_action_reply");
+            String repostLabel = Labels.of(context, "Repost", "button_action_retweet");
+            String undoRepostLabel = Labels.of(context, "Undo repost", "tweets_undo_retweet_vertical");
+            String likeLabel = Labels.of(context, "Like", "button_action_like");
+            String unlikeLabel = Labels.of(context, "Unlike", "sports_play_undo_like_post_action");
+            String bookmarkLabel = Labels.of(context, "Bookmark", "sports_play_bookmark_post_action");
+            String removeBookmarkLabel = Labels.of(context, "Remove bookmark", "sports_play_remove_bookmark_post_action");
+
+            View reply = iconButton(context, replyLabel, muted, e.replies, "\u21A9",
                     "ic_vector_reply_stroke", "ic_vector_reply");
             reply.setOnClickListener(view -> openInX(context, card.intentLink("post", "in_reply_to")));
 
             // Repost offers X's own choices (repost or quote; undo once reposted) instead of
             // reposting publicly on a single tap. Repost and undo run in place, like like/bookmark.
             ToggleState repostState = new ToggleState(e.reposted, e.reposts);
-            LinearLayout repost = (LinearLayout) iconButton(context, "Repost", muted, null, "\u21BB", "ic_vector_retweet_stroke");
-            Runnable paintRepost = () -> fillButton(repost, repostState.active ? "Undo repost" : "Repost",
+            LinearLayout repost = (LinearLayout) iconButton(context, repostLabel, muted, null, "\u21BB", "ic_vector_retweet_stroke");
+            Runnable paintRepost = () -> fillButton(repost, repostState.active ? undoRepostLabel : repostLabel,
                     repostState.active ? REPOST_COLOR : muted, repostState.count, "\u21BB",
                     repostState.active ? "ic_vector_retweet" : "ic_vector_retweet_stroke", "ic_vector_retweet");
             paintRepost.run();
@@ -1312,8 +1583,8 @@ public final class MagazineFeed {
             // Like, repost and bookmark run through X's own service in one tap; when X re-emits the
             // post with the new state, the card redraws with it.
             ToggleState likeState = new ToggleState(e.liked, e.likes);
-            LinearLayout like = (LinearLayout) iconButton(context, "Like", muted, null, "\u2661", "ic_vector_heart_stroke");
-            Runnable paintLike = () -> fillButton(like, likeState.active ? "Unlike" : "Like",
+            LinearLayout like = (LinearLayout) iconButton(context, likeLabel, muted, null, "\u2661", "ic_vector_heart_stroke");
+            Runnable paintLike = () -> fillButton(like, likeState.active ? unlikeLabel : likeLabel,
                     likeState.active ? LIKE_COLOR : muted, likeState.count,
                     likeState.active ? "\u2665" : "\u2661",
                     likeState.active ? "ic_vector_heart" : "ic_vector_heart_stroke", "ic_vector_heart");
@@ -1339,8 +1610,8 @@ public final class MagazineFeed {
             });
 
             ToggleState bookmarkState = new ToggleState(e.bookmarked, null);
-            LinearLayout bookmark = (LinearLayout) iconButton(context, "Bookmark", muted, null, "\u2606", "ic_vector_bookmark_stroke");
-            Runnable paintBookmark = () -> fillButton(bookmark, bookmarkState.active ? "Remove bookmark" : "Bookmark",
+            LinearLayout bookmark = (LinearLayout) iconButton(context, bookmarkLabel, muted, null, "\u2606", "ic_vector_bookmark_stroke");
+            Runnable paintBookmark = () -> fillButton(bookmark, bookmarkState.active ? removeBookmarkLabel : bookmarkLabel,
                     bookmarkState.active ? accent : muted, null,
                     bookmarkState.active ? "\u2605" : "\u2606",
                     bookmarkState.active ? "ic_vector_bookmark" : "ic_vector_bookmark_stroke", "ic_vector_bookmark");
@@ -1353,49 +1624,86 @@ public final class MagazineFeed {
                     confirm(view);
                     rememberAction(card, shownEngagement(card).withBookmarked(bookmarkState.active));
                     refreshGridCard(card.postId, view);
-                    Toast.makeText(context, adding ? "Bookmarked" : "Removed from bookmarks", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(context, adding
+                            ? Labels.of(context, "Bookmarked", "tweet_added_to_your_bookmarks")
+                            : Labels.of(context, "Removed from bookmarks", "tweet_removed_from_your_bookmarks"),
+                            Toast.LENGTH_SHORT).show();
                 } else {
                     // X has no bookmark link; its own bookmark button is on the post screen.
                     Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
                     openInX(context, card.postLink());
                 }
             });
-            View share = iconButton(context, "Share", muted, null, "\u2197",
+            View shareButton = iconButton(context, Labels.of(context, "Share", "button_action_share"), muted, null, "\u2197",
                     "ic_vector_share_android", "ic_vector_share");
-            share.setOnClickListener(view -> sharePost(context, card));
+            shareButton.setOnClickListener(view -> sharePost(context, card));
 
-            // Reply, repost and like spread out; bookmark and share sit at the end, as on X.
+            // Reply, repost and like spread out; bookmark and share sit at the end, as on X. Each
+            // of the three sits at the start of an equal share of the row but keeps its own
+            // size: when the button itself was stretched over its share, a tap anywhere in that
+            // third of the card hit it, and its press highlight was as wide.
             for (View button : new View[]{reply, repost, like}) {
-                row.addView(button, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                FrameLayout cell = new FrameLayout(context);
+                cell.addView(button, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.START | Gravity.CENTER_VERTICAL));
+                row.addView(cell, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
             }
             row.addView(bookmark);
-            row.addView(share);
+            row.addView(shareButton);
+            // The first and last icons line up with the edges of the text above; the buttons'
+            // own padding reaches into the card's padding.
+            rowParams.setMarginStart(-Theme.dpToPx(context, BUTTON_PADDING_DP));
+            rowParams.setMarginEnd(-Theme.dpToPx(context, BUTTON_PADDING_DP));
             row.setTag(ACTIONS_TAG);
             return row;
         }
 
+        // Space around a button's icon: with the 18dp icon it makes the 40dp touch target.
+        private static final float BUTTON_PADDING_DP = 11f;
+
         /**
          * A 40dp touch target with X's own icon when the app ships it (else a text glyph), and the
-         * count beside it when there is one. The label and count form the spoken description.
+         * count beside it when there is one. It is only as wide as its icon and count, and its
+         * press highlight stays inside it. The label and count form the spoken description.
          */
         private static View iconButton(Context context, String label, int color, Long count,
                                        String glyph, String... iconNames) {
             int size = Theme.dpToPx(context, 40f);
             LinearLayout button = new LinearLayout(context);
             button.setOrientation(LinearLayout.HORIZONTAL);
-            button.setGravity(Gravity.CENTER_VERTICAL);
+            button.setGravity(Gravity.CENTER);
             button.setMinimumWidth(size);
             button.setMinimumHeight(size);
             button.setClickable(true);
             button.setFocusable(true);
-            TypedValue ripple = new TypedValue();
-            if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, ripple, true)) {
-                button.setBackgroundResource(ripple.resourceId);
-            }
-            int horizontal = Theme.dpToPx(context, 6f);
+            button.setBackground(pillRipple(context, size / 2f));
+            int horizontal = Theme.dpToPx(context, BUTTON_PADDING_DP);
             button.setPadding(horizontal, 0, horizontal, 0);
             fillButton(button, label, color, count, glyph, iconNames);
             return button;
+        }
+
+        /**
+         * A press highlight shaped like the button (a pill) and bounded by it. The theme's
+         * borderless ripple spreads in a circle as wide as the view and over its neighbours.
+         */
+        private static Drawable pillRipple(Context context, float radius) {
+            int color = 0x33808080;
+            TypedValue value = new TypedValue();
+            try {
+                if (context.getTheme().resolveAttribute(android.R.attr.colorControlHighlight, value, true)) {
+                    if (value.resourceId != 0) {
+                        color = context.getColorStateList(value.resourceId).getDefaultColor();
+                    } else if (value.type >= TypedValue.TYPE_FIRST_COLOR_INT
+                            && value.type <= TypedValue.TYPE_LAST_COLOR_INT) {
+                        color = value.data;
+                    }
+                }
+            } catch (RuntimeException ignored) {
+            }
+            return new android.graphics.drawable.RippleDrawable(
+                    ColorStateList.valueOf(color), null, rounded(Color.WHITE, radius));
         }
 
         /** (Re)draws a button's icon and count; also used after a one-tap like or bookmark. */
@@ -1503,7 +1811,8 @@ public final class MagazineFeed {
 
         /** Stands in for media X marks sensitive; tapping opens the post with X's own warning. */
         private static View sensitiveTile(Context context, PostCard card) {
-            TextView tile = text(context, "Sensitive media \u00B7 Tap to view", 14f, Theme.secondaryText(context));
+            TextView tile = text(context, Labels.of(context, "Sensitive media", "settings_sensitive_media_title")
+                    + " \u00B7 " + Labels.of(context, "Tap to view", "view_tweet_text"), 14f, Theme.secondaryText(context));
             tile.setGravity(Gravity.CENTER);
             int vertical = Theme.dpToPx(context, 40f);
             tile.setPadding(Theme.dpToPx(context, 12f), vertical, Theme.dpToPx(context, 12f), vertical);
@@ -2789,6 +3098,8 @@ public final class MagazineFeed {
         final String handle;
         final String avatarUrl;
         final String text;
+        // The tappable stretches of text: links, @mentions, #hashtags, $cashtags.
+        final List<TextLink> links;
         final List<MediaItem> media;
         final String repostedBy;
         final String replyingTo;
@@ -2806,6 +3117,7 @@ public final class MagazineFeed {
         Object item;
 
         private PostCard(String postId, String name, String handle, String avatarUrl, String text,
+                         List<TextLink> links,
                          List<MediaItem> media, String repostedBy, String replyingTo,
                          QuotedPost quote, long postedAt, boolean sensitiveMedia, String coverText,
                          Engagement engagement) {
@@ -2814,6 +3126,7 @@ public final class MagazineFeed {
             this.handle = handle;
             this.avatarUrl = avatarUrl;
             this.text = text;
+            this.links = links;
             this.media = media;
             this.repostedBy = repostedBy;
             this.replyingTo = replyingTo;
@@ -3047,6 +3360,7 @@ public final class MagazineFeed {
                     NewXUtils.rawSourceScreenName(value),
                     avatarOf(author),
                     text,
+                    text == null ? Collections.emptyList() : linksIn(text, shown),
                     media,
                     repostedBy,
                     ToStringParser.fieldValue(shown, "repliedToUserScreenName"),
@@ -3122,6 +3436,67 @@ public final class MagazineFeed {
                 }
             }
             return text;
+        }
+
+        // What X marks up in post text, simplified from its own rules: a name is letters, digits
+        // and "_"; a hashtag needs a letter; an "@" or "#" inside a word or an address is not one.
+        private static final java.util.regex.Pattern MENTION = java.util.regex.Pattern.compile(
+                "(?<![A-Za-z0-9_@/])@([A-Za-z0-9_]{1,15})(?![A-Za-z0-9_])");
+        private static final java.util.regex.Pattern HASHTAG = java.util.regex.Pattern.compile(
+                "(?<![\\p{L}\\p{M}\\p{N}_&/#])#([\\p{L}\\p{M}\\p{N}_]*[\\p{L}\\p{M}][\\p{L}\\p{M}\\p{N}_]*)");
+        private static final java.util.regex.Pattern CASHTAG = java.util.regex.Pattern.compile(
+                "(?<![\\p{L}\\p{N}_$])\\$([A-Za-z]{1,6}(?:[._][A-Za-z]{1,2})?)(?![\\p{L}\\p{N}_])");
+
+        /**
+         * Where the card's text can be tapped, and what each stretch opens. Links come from the
+         * post's own entities (UrlEntity(displayUrl=, expandedUrl=, url=, ...)): the text shows
+         * the display form (see expandLinks) and the tap follows the full address. Mentions,
+         * hashtags and cashtags are found in the text and open X's profile, hashtag and search
+         * screens, which its deep-link router has routes for (/{handle}, /hashtag/{tag}, /search).
+         */
+        private static List<TextLink> linksIn(String text, String post) {
+            List<TextLink> links = new ArrayList<>();
+            String entities = ToStringParser.fieldValue(post, "entityList");
+            String urls = entities == null ? null : ToStringParser.fieldValue(entities, "urls");
+            int offset = 0;
+            while (urls != null) {
+                int start = urls.indexOf("UrlEntity(", offset);
+                if (start < 0) break;
+                int close = matchingClose(urls, urls.indexOf('(', start));
+                if (close < 0) break;
+                String entity = urls.substring(start, close + 1);
+                offset = close + 1;
+                String display = unescape(ToStringParser.fieldValue(entity, "displayUrl"));
+                // The full address can hold commas, which end a plain field read early.
+                String target = between(entity, "expandedUrl=", ", url=");
+                if (!NewXUtils.isHttpUrl(target)) target = ToStringParser.fieldValue(entity, "expandedUrl");
+                if (!NewXUtils.isHttpUrl(target)) target = ToStringParser.fieldValue(entity, "url");
+                if (display == null || display.length() < 4 || !NewXUtils.isHttpUrl(target)) continue;
+                for (int at = text.indexOf(display); at >= 0; at = text.indexOf(display, at + display.length())) {
+                    addLink(links, at, at + display.length(), target);
+                }
+            }
+            java.util.regex.Matcher mention = MENTION.matcher(text);
+            while (mention.find()) addLink(links, mention.start(), mention.end(), profileLink(mention.group(1)));
+            java.util.regex.Matcher hashtag = HASHTAG.matcher(text);
+            while (hashtag.find()) {
+                addLink(links, hashtag.start(), hashtag.end(), "https://x.com/hashtag/" + Uri.encode(hashtag.group(1)));
+            }
+            java.util.regex.Matcher cashtag = CASHTAG.matcher(text);
+            while (cashtag.find()) {
+                addLink(links, cashtag.start(), cashtag.end(),
+                        "https://x.com/search?q=" + Uri.encode("$" + cashtag.group(1)) + "&src=cashtag_click");
+            }
+            return links.isEmpty() ? Collections.emptyList() : links;
+        }
+
+        /** Adds a link unless it overlaps one already there (a "#" inside a shown address, say). */
+        private static void addLink(List<TextLink> links, int start, int end, String url) {
+            if (url == null || start < 0 || end <= start) return;
+            for (TextLink link : links) {
+                if (start < link.end && end > link.start) return;
+            }
+            links.add(new TextLink(start, end, url));
         }
 
         private static QuotedPost quoteOf(String quoted, boolean showSensitive) {
