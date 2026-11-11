@@ -163,6 +163,51 @@ public final class MagazineFeed {
         throw new IllegalStateException("Piko 2.0 requestTimelineRefresh bridge was not patched");
     }
 
+    /**
+     * Patch-time bridge: X's own "this post was seen", on the timeline component's tracker.
+     * X's list calls it for a post that has stayed on screen. The home timeline requests carry
+     * the ids of the posts seen, and the server leaves those out of what it sends next.
+     */
+    private static void markPostSeen(Object urtComponent, Object timelineItem) {
+        throw new IllegalStateException("Piko 2.0 markPostSeen bridge was not patched");
+    }
+
+    // ---------- Telling X which posts were seen ----------
+
+    // X's tracker looks a post up in a cache it keeps on disk, and X runs it off the main thread.
+    private static final java.util.concurrent.ExecutorService SEEN_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private static final int MAX_SEEN_FAILURES = 3;
+    private static final java.util.concurrent.atomic.AtomicInteger seenFailures =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /** False once telling X has failed a few times running: not patched, or not what it was taken for. */
+    private static boolean canTellSeen() {
+        return seenFailures.get() < MAX_SEEN_FAILURES;
+    }
+
+    /**
+     * The cards replace X's list, so nothing ever lingered in it and X took no post for seen:
+     * every refresh and every further page brought back posts the reader had been shown. A
+     * card that has been on screen is reported here the way a list row would have been.
+     */
+    private static void tellSeen(Object urtComponent, List<Object> timelineItems) {
+        if (urtComponent == null || timelineItems.isEmpty() || !canTellSeen()) return;
+        SEEN_EXECUTOR.execute(() -> {
+            for (Object item : timelineItems) {
+                if (!canTellSeen()) return;
+                try {
+                    markPostSeen(urtComponent, item);
+                    seenFailures.set(0);
+                } catch (Throwable t) {
+                    int failures = seenFailures.incrementAndGet();
+                    NewXLogger.printException(() -> LOG_PREFIX + "could not tell X a post was seen ("
+                            + failures + " of " + MAX_SEEN_FAILURES + " tries)", t);
+                }
+            }
+        });
+    }
+
     private static void bookmarkPost(Object service, Object post) {
         throw new IllegalStateException("Piko 2.0 bookmarkPost bridge was not patched");
     }
@@ -755,6 +800,21 @@ public final class MagazineFeed {
         private static final int MAX_RESTORE_TRIES = 3;
         // Layouts pushed through by hand since the reader last touched the feed (see updateWindow).
         private int layoutRepairs;
+        // As in X's list, a post counts as seen once it has stayed on screen for a moment.
+        private static final long SEEN_AFTER_MS = 1000L;
+        private boolean seenCheckPosted;
+        private final Runnable seenCheck = () -> {
+            seenCheckPosted = false;
+            noteSeen();
+        };
+        // Scratch for noteSeen.
+        private final List<Object> seenItems = new ArrayList<>();
+        private final android.graphics.Rect shownPart = new android.graphics.Rect();
+        // The timeline component the seen posts are reported to, and the callback it was found on.
+        private Object seenComponent;
+        private Object seenComponentCallback;
+        // A new view takes over the place remembered for its timeline (see findAnchor), once.
+        private boolean adoptsPlace = true;
         private Object callback;
         private int currentItemCount = -1;
         private boolean loadMoreInFlight;
@@ -922,10 +982,14 @@ public final class MagazineFeed {
             restoreTries = 0;
             if (grid.isEmpty()) {
                 // No posts to find the place among yet; tried again when they arrive.
-                restorePending = anchor != null || !anchors.isEmpty();
+                restorePending = anchor != null || (adoptsPlace && !anchors.isEmpty());
                 return;
             }
-            if (anchor == null) anchor = findAnchor();
+            // Only a view X has just made looks for a place among the remembered ones. A view
+            // with no place of its own is at the top of its timeline: when X replaces the
+            // timeline under it (a refresh), it stays there, with the new posts.
+            if (anchor == null && adoptsPlace) anchor = findAnchor();
+            adoptsPlace = false;
             restorePending = anchor != null;
             if (anchor == null) return;
             restoreTarget = anchor;
@@ -1040,6 +1104,43 @@ public final class MagazineFeed {
                     moving ? BUILD_NANOS_MOVING : BUILD_NANOS_AT_REST);
             // Cards near the screen are still waiting: the next frame goes on with them.
             if (more) postWindow();
+            noteSeen();
+        }
+
+        /**
+         * Tells X about the cards that have been on screen for a moment (see tellSeen). Run
+         * with every window pass, and again a moment later while cards are waiting to count.
+         */
+        private void noteSeen() {
+            if (!canTellSeen()) return;
+            // Only while this feed is in front of the reader: X's pager keeps the other
+            // timeline's feed alive beside it, off screen.
+            boolean shown = isAttachedToWindow() && getWindowVisibility() == View.VISIBLE && isShown()
+                    && getGlobalVisibleRect(shownPart)
+                    && shownPart.height() * 2 > getHeight() && shownPart.width() * 2 > getWidth();
+            Object component = shown ? seenComponent() : null;
+            // Below the top inset, which X's top bar covers.
+            int top = getScrollY() - grid.getTop();
+            int bottom = component == null ? top : top + getHeight() - getPaddingTop();
+            seenItems.clear();
+            boolean waiting = grid.collectSeen(top, bottom, android.os.SystemClock.uptimeMillis(),
+                    SEEN_AFTER_MS, seenItems);
+            if (!seenItems.isEmpty()) tellSeen(component, new ArrayList<>(seenItems));
+            seenItems.clear();
+            if (waiting && !seenCheckPosted) {
+                seenCheckPosted = true;
+                postDelayed(seenCheck, SEEN_AFTER_MS);
+            }
+        }
+
+        // Looked for once per callback X hands over, and kept once found: every callback of
+        // this feed leads to the same timeline component.
+        private Object seenComponent() {
+            if (seenComponent == null && seenComponentCallback != callback) {
+                seenComponentCallback = callback;
+                seenComponent = ProfilePhotosGallery.urtComponentOf(callback);
+            }
+            return seenComponent;
         }
 
         void refreshCard(String postId, View except) {
@@ -1086,6 +1187,8 @@ public final class MagazineFeed {
             // Going to the top is an explicit request only (Home re-select, see onReselected), so
             // coming back from a post never throws the reader to the top.
             if (restorePending || rebuilt) restoreAnchorAfterLayout();
+            // From its first posts on, this view's place is its own (see restoreAnchorAfterLayout).
+            if (!grid.isEmpty()) adoptsPlace = false;
             if (currentItemCount != next.size()) {
                 int previous = currentItemCount;
                 log("items=" + next.size() + " cards=" + cards.size() + " previous=" + previous);
@@ -1587,6 +1690,40 @@ public final class MagazineFeed {
         }
 
         /**
+         * The cards on screen between {@code visibleTop} and {@code visibleBottom} (nothing is,
+         * when the two are equal). The timeline item of one that has been there for
+         * {@code after} ms is added to {@code seen}, once per slot. Returns true while cards
+         * on screen are still short of that.
+         */
+        boolean collectSeen(int visibleTop, int visibleBottom, long now, long after, List<Object> seen) {
+            boolean waiting = false;
+            int screen = visibleBottom - visibleTop;
+            for (int i = 0; i < getChildCount(); i++) {
+                CardSlot slot = slotAt(i);
+                if (slot.seenTold) continue;
+                boolean onScreen = false;
+                if (screen > 0 && slot.isLaidOut() && slot.hasCard()) {
+                    int shown = Math.min(slot.getBottom(), visibleBottom) - Math.max(slot.getTop(), visibleTop);
+                    // Half of the card; of a card taller than the screen, half of the screen.
+                    onScreen = shown > 0 && shown * 2 >= Math.min(slot.getHeight(), screen);
+                }
+                if (!onScreen) {
+                    slot.onScreenSince = 0L;
+                    continue;
+                }
+                if (slot.onScreenSince == 0L) slot.onScreenSince = now;
+                if (now - slot.onScreenSince < after) {
+                    waiting = true;
+                    continue;
+                }
+                slot.seenTold = true;
+                Object item = slot.card().item;
+                if (item != null) seen.add(item);
+            }
+            return waiting;
+        }
+
+        /**
          * Whether a column may start {@code by} higher (see columnBase). Columns that gave way
          * by different amounts start at different heights, which shows at the start of the
          * feed; they are kept within a quarter of a screen of each other. Past that the card
@@ -1659,6 +1796,10 @@ public final class MagazineFeed {
         private boolean picturesWanted;
         // How far from the screen this slot is; scratch for MasonryGrid.updateWindow.
         int away;
+        // Since when the card has been on screen (0: it is not), and whether X has been told
+        // the post was seen (see MasonryGrid.collectSeen).
+        long onScreenSince;
+        boolean seenTold;
         // Building this card failed once; it stays an empty placeholder rather than be tried
         // (and fail) on every layout.
         private boolean unbuildable;

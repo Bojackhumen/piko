@@ -41,6 +41,7 @@ import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 
 private const val MAGAZINE_EXTENSION = "Lapp/morphe/extension/newx/misc/MagazineFeed;"
 private const val OBJECT = "Ljava/lang/Object;"
@@ -355,6 +356,119 @@ private fun patchHomeReselect() {
     }
 }
 
+// X's record of the posts the reader has seen, sent with the home timeline requests as
+// seen_tweet_ids: the class that keeps "<user id>_recent_seen_post_ids".
+private object SeenPostsCacheFingerprint : Fingerprint(
+    definingClass = "Lcom/x/repositories/urt/",
+    filters = listOf(string("_recent_seen_post_ids")),
+)
+
+private const val SEEN_QUEUE = "Ljava/util/concurrent/ConcurrentLinkedQueue;"
+private const val URT_SCOPE = "Lcom/x/urt/"
+
+/** True for "mark this timeline item's post as seen": tells posts apart and adds to the cache's queue. */
+private fun Method.addsToSeenQueue(cacheTypes: Set<String>, timelinePost: String): Boolean {
+    val instructions = implementation?.instructions ?: return false
+    var tellsPosts = false
+    var readsQueue = false
+    var adds = false
+    for (instruction in instructions) {
+        when (instruction.opcode) {
+            Opcode.INSTANCE_OF, Opcode.CHECK_CAST -> {
+                if (instruction.getReference<TypeReference>()?.type == timelinePost) tellsPosts = true
+            }
+            Opcode.INVOKE_VIRTUAL, Opcode.INVOKE_INTERFACE -> {
+                val call = instruction.getReference<MethodReference>()
+                if (call != null) {
+                    if (call.definingClass in cacheTypes && call.returnType == SEEN_QUEUE) readsQueue = true
+                    if (call.definingClass == SEEN_QUEUE && call.name == "add" && call.returnType == "Z") adds = true
+                }
+            }
+            else -> Unit
+        }
+    }
+    return tellsPosts && readsQueue && adds
+}
+
+/**
+ * X takes a post for seen when its row has lingered in the native list, and the home timeline
+ * requests carry the ids of the posts seen, so the server leaves them out of what it sends next.
+ * The card feed replaces the list: nothing lingers, nothing was ever marked, and every refresh and
+ * every further page brought back posts the reader had been shown. [markPostSeen] is X's own
+ * "mark seen", on the tracker the timeline component creates for itself; the feed calls it for a
+ * card that has stayed on screen.
+ */
+context(context: BytecodePatchContext)
+private fun patchSeenPosts() {
+    val timelinePost = resolvedNewXTimelineModels().postDescriptor
+    val cacheType = requireExactlyOne(
+        "NewX seen-posts cache",
+        SeenPostsCacheFingerprint.scopedMatchAll().map { it.method.definingClass }.distinct(),
+    )
+    val cacheTypes = context.classDefBy(cacheType).interfaces.toSet() + cacheType
+
+    val urtClasses = buildList<ClassDef> {
+        context.classDefForEach { if (it.type.startsWith(URT_SCOPE)) add(it) }
+    }
+    // The one public instance method (timelineItem)V in the timeline's own code that adds a
+    // post's id to the cache's queue of seen ids.
+    val markSeen = requireExactlyOne(
+        "NewX mark-post-seen method",
+        urtClasses.flatMap { classDef ->
+            classDef.methods.filter { method ->
+                method.returnType == "V" &&
+                    method.parameterTypes.size == 1 &&
+                    AccessFlags.PUBLIC.isSet(method.accessFlags) &&
+                    !AccessFlags.STATIC.isSet(method.accessFlags) &&
+                    method.addsToSeenQueue(cacheTypes, timelinePost)
+            }
+        },
+    ) { it.smaliReference() }
+    val trackerType = markSeen.definingClass
+
+    // The timeline component is the class that creates the tracker for itself, in its
+    // constructor, and keeps it in a field of the tracker's own type.
+    val component = requireExactlyOne(
+        "NewX timeline component that creates the seen-posts tracker",
+        urtClasses.filter { classDef ->
+            classDef.type != trackerType && classDef.methods.any { method ->
+                method.name == "<init>" && method.implementation?.instructions?.any { instruction ->
+                    (instruction.opcode == Opcode.INVOKE_DIRECT || instruction.opcode == Opcode.INVOKE_DIRECT_RANGE) &&
+                        instruction.getReference<MethodReference>()?.let { call ->
+                            call.name == "<init>" && call.definingClass == trackerType
+                        } == true
+                } == true
+            }
+        },
+    ) { it.type }
+    val trackerField = requireExactlyOne(
+        "NewX timeline component's seen-posts tracker field",
+        component.fields.filter { field ->
+            field.type == trackerType && !AccessFlags.STATIC.isSet(field.accessFlags)
+        },
+    ) { "${it.definingClass}->${it.name}:${it.type}" }
+    // The bridge lives in the extension, another package: everything it touches must be public.
+    val trackerClass = context.classDefBy(trackerType)
+    if (!AccessFlags.PUBLIC.isSet(component.accessFlags) ||
+        !AccessFlags.PUBLIC.isSet(trackerClass.accessFlags) ||
+        !AccessFlags.PUBLIC.isSet(trackerField.accessFlags)
+    ) {
+        throw PatchException(
+            "NewX seen-posts tracker ${trackerField.definingClass}->${trackerField.name} is not reachable from the extension",
+        )
+    }
+
+    replaceBridge("markPostSeen", listOf(OBJECT, OBJECT), "V", totalRegisters = 4) { p0 ->
+        move(0, p0, OBJECT)
+        checkCast(0, component.type)
+        iget(0, 0, trackerField)
+        move(1, p0 + 1, OBJECT)
+        checkCast(1, markSeen.parameterTypes[0].toString())
+        invokeVirtual(methodReference(markSeen.smaliReference()), 0, 1)
+        returnVoid()
+    }
+}
+
 private const val NESTED_SCROLL_VIEW = "Landroidx/core/widget/NestedScrollView;"
 
 /**
@@ -475,6 +589,8 @@ private fun requireScrollContainersLink() {
  * target's own NestedScrollView ([requireScrollContainersLink]), and wires one-tap
  * like/unlike/repost/bookmark to X's own post-actions service. That wiring is optional: when it
  * cannot be resolved the cards keep using X's in-app action links, so the layout still ships.
+ * So are Home re-select ([patchHomeReselect]) and telling X which posts the cards showed
+ * ([patchSeenPosts]).
  */
 @Suppress("unused")
 val newXMagazineFeedPatch =
@@ -523,6 +639,12 @@ val newXMagazineFeedPatch =
             runCatching { patchHomeReselect() }
                 .onFailure { failure ->
                     System.err.println("NewX Piko 2.0: Home re-select not forwarded to the cards: ${failure.message}")
+                }
+            // Also optional: without it X is not told which posts the cards showed, and keeps
+            // sending them again (the state of every build before this step existed).
+            runCatching { patchSeenPosts() }
+                .onFailure { failure ->
+                    System.err.println("NewX Piko 2.0: seen posts are not reported to X: ${failure.message}")
                 }
         }
     }
