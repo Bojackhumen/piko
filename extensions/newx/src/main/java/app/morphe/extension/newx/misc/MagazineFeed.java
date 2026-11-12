@@ -164,48 +164,83 @@ public final class MagazineFeed {
     }
 
     /**
-     * Patch-time bridge: X's own "this post was seen", on the timeline component's tracker.
-     * X's list calls it for a post that has stayed on screen. The home timeline requests carry
-     * the ids of the posts seen, and the server leaves those out of what it sends next.
+     * Patch-time bridges: what a row of X's own list tells its timeline, sent for a card
+     * instead. X's list reports where its scrolling area is, where each row is as it moves
+     * (ScrollableContainerPositioned and ItemPositioned, in window coordinates) and when a row
+     * is gone (ItemDisposed). Everything X does about a post being looked at hangs off those
+     * reports: how long it stayed on screen, the ids of the posts seen that the next home
+     * request carries (seen_tweet_ids), and the view it counts for the post. Each bridge sends
+     * the event through the timeline component's own event method, as X's rows do.
      */
-    private static void markPostSeen(Object urtComponent, Object timelineItem) {
-        throw new IllegalStateException("Piko 2.0 markPostSeen bridge was not patched");
+    private static void reportContainer(Object urtComponent, float left, float top, float right, float bottom) {
+        throw new IllegalStateException("Piko 2.0 reportContainer bridge was not patched");
     }
 
-    // ---------- Telling X which posts were seen ----------
-
-    // X's tracker looks a post up in a cache it keeps on disk, and X runs it off the main thread.
-    private static final java.util.concurrent.ExecutorService SEEN_EXECUTOR =
-            java.util.concurrent.Executors.newSingleThreadExecutor();
-    private static final int MAX_SEEN_FAILURES = 3;
-    private static final java.util.concurrent.atomic.AtomicInteger seenFailures =
-            new java.util.concurrent.atomic.AtomicInteger();
-
-    /** False once telling X has failed a few times running: not patched, or not what it was taken for. */
-    private static boolean canTellSeen() {
-        return seenFailures.get() < MAX_SEEN_FAILURES;
+    private static void reportCardPositioned(Object urtComponent, Object timelineItem,
+                                             float left, float top, float right, float bottom, int index) {
+        throw new IllegalStateException("Piko 2.0 reportCardPositioned bridge was not patched");
     }
 
-    /**
-     * The cards replace X's list, so nothing ever lingered in it and X took no post for seen:
-     * every refresh and every further page brought back posts the reader had been shown. A
-     * card that has been on screen is reported here the way a list row would have been.
-     */
-    private static void tellSeen(Object urtComponent, List<Object> timelineItems) {
-        if (urtComponent == null || timelineItems.isEmpty() || !canTellSeen()) return;
-        SEEN_EXECUTOR.execute(() -> {
-            for (Object item : timelineItems) {
-                if (!canTellSeen()) return;
-                try {
-                    markPostSeen(urtComponent, item);
-                    seenFailures.set(0);
-                } catch (Throwable t) {
-                    int failures = seenFailures.incrementAndGet();
-                    NewXLogger.printException(() -> LOG_PREFIX + "could not tell X a post was seen ("
-                            + failures + " of " + MAX_SEEN_FAILURES + " tries)", t);
-                }
-            }
-        });
+    private static void reportCardDisposed(Object urtComponent, Object timelineItem) {
+        throw new IllegalStateException("Piko 2.0 reportCardDisposed bridge was not patched");
+    }
+
+    // ---------- Reporting cards to X the way its own list rows report themselves ----------
+
+    // The cards replace X's list, so no row ever reported itself: X took no post for seen or
+    // viewed, and every refresh and every further page could bring back posts the reader had
+    // just been shown. An earlier fix called X's "mark seen" on the timeline component's
+    // tracker directly; on Home the feed holds the For You / Following component, which only
+    // forwards to the one that owns the tracker, so that call failed every time. The reports
+    // go through the component's own event method instead, which every component has.
+    private static final int MAX_REPORT_FAILURES = 3;
+    // Main thread only, as everything below is.
+    private static int reportFailures;
+
+    /** False once reporting has failed a few times running: not patched, or not what it was taken for. */
+    private static boolean canReport() {
+        return reportFailures < MAX_REPORT_FAILURES;
+    }
+
+    private static void reportFailed(String what, Throwable t) {
+        int failures = ++reportFailures;
+        NewXLogger.printException(() -> LOG_PREFIX + "could not report " + what + " to X ("
+                + failures + " of " + MAX_REPORT_FAILURES + " tries)", t);
+    }
+
+    private static boolean tellContainer(Object urtComponent, int left, int top, int right, int bottom) {
+        if (!canReport()) return false;
+        try {
+            reportContainer(urtComponent, left, top, right, bottom);
+            reportFailures = 0;
+            return true;
+        } catch (Throwable t) {
+            reportFailed("the feed's place", t);
+            return false;
+        }
+    }
+
+    private static boolean tellPositioned(Object urtComponent, Object timelineItem,
+                                          int left, int top, int right, int bottom, int index) {
+        if (!canReport()) return false;
+        try {
+            reportCardPositioned(urtComponent, timelineItem, left, top, right, bottom, index);
+            reportFailures = 0;
+            return true;
+        } catch (Throwable t) {
+            reportFailed("a card's place", t);
+            return false;
+        }
+    }
+
+    private static void tellDisposed(Object urtComponent, Object timelineItem) {
+        if (!canReport()) return;
+        try {
+            reportCardDisposed(urtComponent, timelineItem);
+            reportFailures = 0;
+        } catch (Throwable t) {
+            reportFailed("a card that left the screen", t);
+        }
     }
 
     private static void bookmarkPost(Object service, Object post) {
@@ -800,19 +835,34 @@ public final class MagazineFeed {
         private static final int MAX_RESTORE_TRIES = 3;
         // Layouts pushed through by hand since the reader last touched the feed (see updateWindow).
         private int layoutRepairs;
-        // As in X's list, a post counts as seen once it has stayed on screen for a moment.
-        private static final long SEEN_AFTER_MS = 1000L;
-        private boolean seenCheckPosted;
-        private final Runnable seenCheck = () -> {
-            seenCheckPosted = false;
-            noteSeen();
-        };
-        // Scratch for noteSeen.
-        private final List<Object> seenItems = new ArrayList<>();
+        // The cards on screen are reported to X as its own rows report themselves (see
+        // reportRows). While the feed moves, at most this often: X's rows report as they
+        // move too, and X only needs to hear when a card comes on screen, that it is still
+        // there, and when it leaves.
+        private static final long REPORT_EVERY_MS = 100L;
+        // X decides that a post was seen when it hears from a row that has stayed on screen
+        // past its threshold (a second, unless X's servers say otherwise). Its rows are only
+        // heard from when they move; a card that is being read does not. So a feed at rest
+        // reports its cards again a few times, this far apart.
+        private static final long REPORT_AGAIN_MS = 1500L;
+        private static final int REPORTS_AT_REST = 3;
+        private int reportsAtRestLeft;
+        private long lastReportAt;
+        // A pass was put off because the one before it was too recent; the timer makes up for it.
+        private boolean reportOwed;
+        private final Runnable reportCheck = () -> reportRows(true);
+        // Scratch for reportRows.
+        private final int[] placeInWindow = new int[2];
         private final android.graphics.Rect shownPart = new android.graphics.Rect();
-        // The timeline component the seen posts are reported to, and the callback it was found on.
-        private Object seenComponent;
-        private Object seenComponentCallback;
+        // The timeline component the cards are reported to, and the callback it was found on.
+        private Object rowComponent;
+        private Object rowComponentCallback;
+        // The feed's own place as X was last told it (see reportRows); none while containerTold is false.
+        private boolean containerTold;
+        private int containerLeft;
+        private int containerTop;
+        private int containerRight;
+        private int containerBottom;
         // A new view takes over the place remembered for its timeline (see findAnchor), once.
         private boolean adoptsPlace = true;
         private Object callback;
@@ -844,6 +894,9 @@ public final class MagazineFeed {
                 public void onViewDetachedFromWindow(View view) {
                     liveViews.remove(MagazineView.this);
                     if (topAnimator != null) topAnimator.cancel();
+                    // The cards are gone from the screen with the feed: X is told, as it is
+                    // when its own rows go.
+                    stopReporting();
                 }
             });
             // The listeners only call methods: the grid they work on is made further down.
@@ -1104,43 +1157,88 @@ public final class MagazineFeed {
                     moving ? BUILD_NANOS_MOVING : BUILD_NANOS_AT_REST);
             // Cards near the screen are still waiting: the next frame goes on with them.
             if (more) postWindow();
-            noteSeen();
+            reportRows(false);
         }
 
         /**
-         * Tells X about the cards that have been on screen for a moment (see tellSeen). Run
-         * with every window pass, and again a moment later while cards are waiting to count.
+         * Tells X where the cards on screen are, in the window, the way the rows of its own
+         * list tell it (see the report bridges), and which cards have left the screen. X works
+         * out the rest as it does for a row: how much of the card shows, how long it has
+         * stayed, that the post was seen, the view it counts. Run with every window pass (the
+         * feed moved, or was laid out) and from a timer while the feed is at rest.
          */
-        private void noteSeen() {
-            if (!canTellSeen()) return;
+        private void reportRows(boolean fromTimer) {
+            if (!canReport()) return;
+            long now = android.os.SystemClock.uptimeMillis();
+            if (!fromTimer && now - lastReportAt < REPORT_EVERY_MS) {
+                if (!reportOwed) {
+                    reportOwed = true;
+                    postReportCheck(REPORT_EVERY_MS);
+                }
+                return;
+            }
+            // At rest (the timer, with nothing owed) every card on screen is reported again;
+            // otherwise only the ones that moved.
+            boolean atRest = fromTimer && !reportOwed;
+            reportOwed = false;
+            lastReportAt = now;
+            removeCallbacks(reportCheck);
             // Only while this feed is in front of the reader: X's pager keeps the other
             // timeline's feed alive beside it, off screen.
             boolean shown = isAttachedToWindow() && getWindowVisibility() == View.VISIBLE && isShown()
                     && getGlobalVisibleRect(shownPart)
                     && shownPart.height() * 2 > getHeight() && shownPart.width() * 2 > getWidth();
-            Object component = shown ? seenComponent() : null;
-            // Below the top inset, which X's top bar covers.
-            int top = getScrollY() - grid.getTop();
-            int bottom = component == null ? top : top + getHeight() - getPaddingTop();
-            seenItems.clear();
-            boolean waiting = grid.collectSeen(top, bottom, android.os.SystemClock.uptimeMillis(),
-                    SEEN_AFTER_MS, seenItems);
-            if (!seenItems.isEmpty()) tellSeen(component, new ArrayList<>(seenItems));
-            seenItems.clear();
-            if (waiting && !seenCheckPosted) {
-                seenCheckPosted = true;
-                postDelayed(seenCheck, SEEN_AFTER_MS);
+            Object component = shown ? rowComponent() : null;
+            if (component == null) {
+                stopReporting();
+                return;
             }
+            // The feed's place, below the top inset (X's top bar covers that part).
+            getLocationInWindow(placeInWindow);
+            int left = placeInWindow[0];
+            int top = placeInWindow[1] + getPaddingTop();
+            int right = placeInWindow[0] + getWidth();
+            int bottom = placeInWindow[1] + getHeight();
+            if (bottom <= top || right <= left) return;
+            // Told when it changes, and again with each pass at rest: the timeline behind a
+            // For You or Following component can be replaced, and the new one has not heard.
+            if (atRest || !containerTold || left != containerLeft || top != containerTop
+                    || right != containerRight || bottom != containerBottom) {
+                if (!tellContainer(component, left, top, right, bottom)) return;
+                containerTold = true;
+                containerLeft = left;
+                containerTop = top;
+                containerRight = right;
+                containerBottom = bottom;
+            }
+            grid.getLocationInWindow(placeInWindow);
+            int onScreen = grid.reportRows(component, placeInWindow[0], placeInWindow[1], top, bottom, atRest);
+            if (atRest) reportsAtRestLeft--;
+            else reportsAtRestLeft = REPORTS_AT_REST;
+            if (onScreen > 0 && reportsAtRestLeft > 0) postReportCheck(REPORT_AGAIN_MS);
+        }
+
+        private void postReportCheck(long delayMs) {
+            removeCallbacks(reportCheck);
+            postDelayed(reportCheck, delayMs);
+        }
+
+        /** This feed is no longer in front of the reader: its cards have left the screen. */
+        private void stopReporting() {
+            removeCallbacks(reportCheck);
+            reportOwed = false;
+            containerTold = false;
+            if (rowComponent != null) grid.disposeReported(rowComponent);
         }
 
         // Looked for once per callback X hands over, and kept once found: every callback of
         // this feed leads to the same timeline component.
-        private Object seenComponent() {
-            if (seenComponent == null && seenComponentCallback != callback) {
-                seenComponentCallback = callback;
-                seenComponent = ProfilePhotosGallery.urtComponentOf(callback);
+        private Object rowComponent() {
+            if (rowComponent == null && rowComponentCallback != callback) {
+                rowComponentCallback = callback;
+                rowComponent = ProfilePhotosGallery.urtComponentOf(callback);
             }
-            return seenComponent;
+            return rowComponent;
         }
 
         void refreshCard(String postId, View except) {
@@ -1311,6 +1409,9 @@ public final class MagazineFeed {
         private int[] tops = new int[0];
         // The empty slots near the screen, nearest first; scratch for updateWindow.
         private final List<CardSlot> waiting = new ArrayList<>();
+        // The post items of slots that left the grid after X was told their cards were on
+        // screen; X is told they went with the next report (see reportRows).
+        private final List<Object> disposals = new ArrayList<>();
         // The post at the top of the screen (null at the start of the feed), from the scroll
         // container.
         private String focusPostId;
@@ -1454,7 +1555,7 @@ public final class MagazineFeed {
                     addView(slot);
                 }
                 // Cards of posts that are gone stop waiting for their pictures.
-                for (CardSlot gone : kept.values()) gone.discard();
+                for (CardSlot gone : kept.values()) retire(gone);
             } else {
                 // Same posts in the same places: refresh only cards whose shown counts or state
                 // changed, e.g. once X re-sends a post the reader just liked. Update the action
@@ -1469,7 +1570,7 @@ public final class MagazineFeed {
                     CardSlot slot = slotAt(i);
                     if (!old.sameContentAs(card)) {
                         // The post itself changed (an edit, or now shown as someone's repost).
-                        slot.discard();
+                        retire(slot);
                         removeViewAt(i);
                         addView(new CardSlot(getContext(), card), i);
                     } else {
@@ -1690,37 +1791,70 @@ public final class MagazineFeed {
         }
 
         /**
-         * The cards on screen between {@code visibleTop} and {@code visibleBottom} (nothing is,
-         * when the two are equal). The timeline item of one that has been there for
-         * {@code after} ms is added to {@code seen}, once per slot. Returns true while cards
-         * on screen are still short of that.
+         * Tells X where each card on screen is and which cards have left it (see the report
+         * bridges). {@code gridLeft}/{@code gridTop}: where this grid is in the window;
+         * {@code shownTop}/{@code shownBottom}: the part of the window the feed shows.
+         * {@code all}: every card on screen is reported, not only the ones that moved.
+         * Returns how many cards are on screen.
          */
-        boolean collectSeen(int visibleTop, int visibleBottom, long now, long after, List<Object> seen) {
-            boolean waiting = false;
-            int screen = visibleBottom - visibleTop;
+        int reportRows(Object component, int gridLeft, int gridTop, int shownTop, int shownBottom, boolean all) {
+            flushDisposals(component);
+            int onScreen = 0;
             for (int i = 0; i < getChildCount(); i++) {
                 CardSlot slot = slotAt(i);
-                if (slot.seenTold) continue;
-                boolean onScreen = false;
-                if (screen > 0 && slot.isLaidOut() && slot.hasCard()) {
-                    int shown = Math.min(slot.getBottom(), visibleBottom) - Math.max(slot.getTop(), visibleTop);
-                    // Half of the card; of a card taller than the screen, half of the screen.
-                    onScreen = shown > 0 && shown * 2 >= Math.min(slot.getHeight(), screen);
-                }
-                if (!onScreen) {
-                    slot.onScreenSince = 0L;
-                    continue;
-                }
-                if (slot.onScreenSince == 0L) slot.onScreenSince = now;
-                if (now - slot.onScreenSince < after) {
-                    waiting = true;
-                    continue;
-                }
-                slot.seenTold = true;
                 Object item = slot.card().item;
-                if (item != null) seen.add(item);
+                int top = gridTop + slot.getTop();
+                int bottom = gridTop + slot.getBottom();
+                // An empty slot shows no post, and a module read as one card has no post item.
+                if (item == null || !slot.isLaidOut() || !slot.hasCard() || bottom <= shownTop || top >= shownBottom) {
+                    if (slot.reported != null) {
+                        tellDisposed(component, slot.reported);
+                        slot.reported = null;
+                    }
+                    continue;
+                }
+                onScreen++;
+                int left = gridLeft + slot.getLeft();
+                int right = gridLeft + slot.getRight();
+                if (!all && slot.reported != null && slot.sentLeft == left && slot.sentTop == top
+                        && slot.sentRight == right && slot.sentBottom == bottom) {
+                    continue;
+                }
+                // Reporting was switched off after failing: nothing more is sent.
+                if (!tellPositioned(component, item, left, top, right, bottom, i)) break;
+                slot.reported = item;
+                slot.sentLeft = left;
+                slot.sentTop = top;
+                slot.sentRight = right;
+                slot.sentBottom = bottom;
             }
-            return waiting;
+            return onScreen;
+        }
+
+        /** The feed has left the screen: every card X was told about is gone from it. */
+        void disposeReported(Object component) {
+            flushDisposals(component);
+            for (int i = 0; i < getChildCount(); i++) {
+                CardSlot slot = slotAt(i);
+                if (slot.reported == null) continue;
+                tellDisposed(component, slot.reported);
+                slot.reported = null;
+            }
+        }
+
+        private void flushDisposals(Object component) {
+            if (disposals.isEmpty()) return;
+            for (Object item : disposals) tellDisposed(component, item);
+            disposals.clear();
+        }
+
+        /** A slot that leaves the grid: if X was told about its card, it is told that it went. */
+        private void retire(CardSlot slot) {
+            if (slot.reported != null) {
+                disposals.add(slot.reported);
+                slot.reported = null;
+            }
+            slot.discard();
         }
 
         /**
@@ -1796,10 +1930,14 @@ public final class MagazineFeed {
         private boolean picturesWanted;
         // How far from the screen this slot is; scratch for MasonryGrid.updateWindow.
         int away;
-        // Since when the card has been on screen (0: it is not), and whether X has been told
-        // the post was seen (see MasonryGrid.collectSeen).
-        long onScreenSince;
-        boolean seenTold;
+        // The post item X was last told is on screen for this slot, and where (in the
+        // window); null while X has not been told, or has been told that the card went (see
+        // MasonryGrid.reportRows).
+        Object reported;
+        int sentLeft;
+        int sentTop;
+        int sentRight;
+        int sentBottom;
         // Building this card failed once; it stays an empty placeholder rather than be tried
         // (and fail) on every layout.
         private boolean unbuildable;

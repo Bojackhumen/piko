@@ -41,7 +41,6 @@ import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
-import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 
 private const val MAGAZINE_EXTENSION = "Lapp/morphe/extension/newx/misc/MagazineFeed;"
 private const val OBJECT = "Ljava/lang/Object;"
@@ -356,115 +355,205 @@ private fun patchHomeReselect() {
     }
 }
 
-// X's record of the posts the reader has seen, sent with the home timeline requests as
-// seen_tweet_ids: the class that keeps "<user id>_recent_seen_post_ids".
-private object SeenPostsCacheFingerprint : Fingerprint(
-    definingClass = "Lcom/x/repositories/urt/",
-    filters = listOf(string("_recent_seen_post_ids")),
+private const val URT_SCOPE = "Lcom/x/urt/"
+private const val MODELS_SCOPE = "Lcom/x/models/"
+
+// What a row of X's own list tells its timeline, by the names the events print: where the row is
+// each time it moves, and that it is gone. The list itself reports where its scrolling area is.
+private object ItemPositionedEventFingerprint : Fingerprint(
+    definingClass = URT_SCOPE,
+    filters = listOf(string("ItemPositioned(item=")),
 )
 
-private const val SEEN_QUEUE = "Ljava/util/concurrent/ConcurrentLinkedQueue;"
-private const val URT_SCOPE = "Lcom/x/urt/"
+private object ItemDisposedEventFingerprint : Fingerprint(
+    definingClass = URT_SCOPE,
+    filters = listOf(string("ItemDisposed(item=")),
+)
 
-/** True for "mark this timeline item's post as seen": tells posts apart and adds to the cache's queue. */
-private fun Method.addsToSeenQueue(cacheTypes: Set<String>, timelinePost: String): Boolean {
-    val instructions = implementation?.instructions ?: return false
-    var tellsPosts = false
-    var readsQueue = false
-    var adds = false
-    for (instruction in instructions) {
-        when (instruction.opcode) {
-            Opcode.INSTANCE_OF, Opcode.CHECK_CAST -> {
-                if (instruction.getReference<TypeReference>()?.type == timelinePost) tellsPosts = true
-            }
-            Opcode.INVOKE_VIRTUAL, Opcode.INVOKE_INTERFACE -> {
-                val call = instruction.getReference<MethodReference>()
-                if (call != null) {
-                    if (call.definingClass in cacheTypes && call.returnType == SEEN_QUEUE) readsQueue = true
-                    if (call.definingClass == SEEN_QUEUE && call.name == "add" && call.returnType == "Z") adds = true
-                }
-            }
-            else -> Unit
-        }
+private object ContainerPositionedEventFingerprint : Fingerprint(
+    definingClass = URT_SCOPE,
+    filters = listOf(string("ScrollableContainerPositioned(position=")),
+)
+
+// The rectangle those events carry (left, top, right, bottom, in window coordinates).
+private object TimelineRectFingerprint : Fingerprint(
+    definingClass = MODELS_SCOPE,
+    filters = listOf(string("KMPRect(left=")),
+)
+
+/** The one class whose toString prints the name [fingerprint] looks for. */
+context(context: BytecodePatchContext)
+private fun classNamedByToString(
+    label: String,
+    fingerprint: Fingerprint,
+): ClassDef {
+    val type = requireExactlyOne(
+        label,
+        fingerprint.scopedMatchAll()
+            // Read-only: the event classes themselves are not changed.
+            .filter { it.originalMethod.name == "toString" }
+            .map { it.originalMethod.definingClass }
+            .distinct(),
+    )
+    val classDef = context.classDefBy(type)
+    // The bridges live in the extension, another package: what they construct must be public.
+    if (!AccessFlags.PUBLIC.isSet(classDef.accessFlags)) {
+        throw PatchException("$label $type is not reachable from the extension")
     }
-    return tellsPosts && readsQueue && adds
+    return classDef
 }
 
+/** The one public constructor of [this] with exactly [parameters], in any order. */
+private fun ClassDef.constructorTaking(
+    label: String,
+    parameters: List<String>,
+): Method =
+    requireExactlyOne(
+        "$label constructor",
+        methods.filter { method ->
+            method.name == "<init>" &&
+                AccessFlags.PUBLIC.isSet(method.accessFlags) &&
+                method.parameterDescriptors().sorted() == parameters.sorted()
+        },
+    ) { it.smaliReference() }
+
 /**
- * X takes a post for seen when its row has lingered in the native list, and the home timeline
- * requests carry the ids of the posts seen, so the server leaves them out of what it sends next.
- * The card feed replaces the list: nothing lingers, nothing was ever marked, and every refresh and
- * every further page brought back posts the reader had been shown. [markPostSeen] is X's own
- * "mark seen", on the tracker the timeline component creates for itself; the feed calls it for a
- * card that has stayed on screen.
+ * X learns that a post is being looked at from the rows of its list: each row reports where it
+ * is every time it moves (ItemPositioned), the list reports where its scrolling area is
+ * (ScrollableContainerPositioned), and a row that leaves reports that too (ItemDisposed). The
+ * timeline component hands those reports to its linger tracker and its impression scribes, which
+ * work out how much of the post shows and for how long. That is what marks a post as seen (the
+ * ids the next home request carries as seen_tweet_ids, so the server leaves those posts out of
+ * what it sends next) and what counts its view.
+ *
+ * The card feed replaces the list: no row exists, nothing was ever reported, and every refresh and
+ * every further page could bring back posts the reader had just been shown. These bridges let
+ * the feed send the same three reports for its cards, through the component's own event method,
+ * exactly as the lambdas X hands its list do (`component.event(ItemPositioned(index, rect, item))`).
+ *
+ * The receiver is the component interface, not the class that owns the tracker. On Home the object
+ * the list (and so the feed) holds is the For You or Following component, which implements that
+ * interface by forwarding to the timeline component it wraps. An earlier step called the tracker's
+ * "mark seen" on the wrapped class directly; its cast failed on every Home timeline, so nothing was
+ * ever marked (incident 2026-11-12).
  */
 context(context: BytecodePatchContext)
-private fun patchSeenPosts() {
+private fun patchRowReports() {
     val timelinePost = resolvedNewXTimelineModels().postDescriptor
-    val cacheType = requireExactlyOne(
-        "NewX seen-posts cache",
-        SeenPostsCacheFingerprint.scopedMatchAll().map { it.method.definingClass }.distinct(),
-    )
-    val cacheTypes = context.classDefBy(cacheType).interfaces.toSet() + cacheType
+    val rect = classNamedByToString("NewX timeline rect", TimelineRectFingerprint)
+    val rectConstructor = requireExactlyOne(
+        "NewX timeline rect constructor",
+        rect.methods.filter { method ->
+            method.name == "<init>" &&
+                AccessFlags.PUBLIC.isSet(method.accessFlags) &&
+                method.parameterDescriptors() == listOf("F", "F", "F", "F")
+        },
+    ) { it.smaliReference() }
 
-    val urtClasses = buildList<ClassDef> {
-        context.classDefForEach { if (it.type.startsWith(URT_SCOPE)) add(it) }
+    val positioned = classNamedByToString("NewX ItemPositioned event", ItemPositionedEventFingerprint)
+    val disposed = classNamedByToString("NewX ItemDisposed event", ItemDisposedEventFingerprint)
+    val container = classNamedByToString(
+        "NewX ScrollableContainerPositioned event",
+        ContainerPositionedEventFingerprint,
+    )
+
+    // ItemDisposed(item) names the timeline item type; a timeline post must be one.
+    val disposedConstructor = requireExactlyOne(
+        "NewX ItemDisposed event constructor",
+        disposed.methods.filter { method ->
+            method.name == "<init>" &&
+                AccessFlags.PUBLIC.isSet(method.accessFlags) &&
+                method.parameterTypes.size == 1 &&
+                method.parameterDescriptors()[0].startsWith("L")
+        },
+    ) { it.smaliReference() }
+    val itemType = disposedConstructor.parameterDescriptors()[0]
+    if (itemType == rect.type) {
+        throw PatchException("NewX ItemDisposed event ${disposed.type} carries a rect, not a timeline item")
     }
-    // The one public instance method (timelineItem)V in the timeline's own code that adds a
-    // post's id to the cache's queue of seen ids.
-    val markSeen = requireExactlyOne(
-        "NewX mark-post-seen method",
-        urtClasses.flatMap { classDef ->
+    if (itemType != timelinePost && itemType !in context.classDefBy(timelinePost).interfaces) {
+        throw PatchException("NewX timeline post $timelinePost is not a timeline item $itemType")
+    }
+    val positionedConstructor = positioned.constructorTaking(
+        "NewX ItemPositioned event",
+        listOf("I", rect.type, itemType),
+    )
+    val containerConstructor = container.constructorTaking(
+        "NewX ScrollableContainerPositioned event",
+        listOf(rect.type),
+    )
+
+    // The three events share the timeline event interface, and one interface takes such an event:
+    // the timeline component, which every timeline (and every wrapper around one) implements.
+    val eventInterface = requireExactlyOne(
+        "NewX timeline event interface",
+        positioned.interfaces.filter { it in disposed.interfaces && it in container.interfaces },
+    )
+    val componentInterfaces = buildList<ClassDef> {
+        context.classDefForEach { classDef ->
+            if (classDef.type.startsWith(URT_SCOPE) && AccessFlags.INTERFACE.isSet(classDef.accessFlags)) {
+                add(classDef)
+            }
+        }
+    }
+    val eventMethod = requireExactlyOne(
+        "NewX timeline component event method",
+        componentInterfaces.flatMap { classDef ->
             classDef.methods.filter { method ->
-                method.returnType == "V" &&
-                    method.parameterTypes.size == 1 &&
-                    AccessFlags.PUBLIC.isSet(method.accessFlags) &&
-                    !AccessFlags.STATIC.isSet(method.accessFlags) &&
-                    method.addsToSeenQueue(cacheTypes, timelinePost)
+                method.returnType == "V" && method.parameterDescriptors() == listOf(eventInterface)
             }
         },
     ) { it.smaliReference() }
-    val trackerType = markSeen.definingClass
+    val componentInterface = eventMethod.definingClass
 
-    // The timeline component is the class that creates the tracker for itself, in its
-    // constructor, and keeps it in a field of the tracker's own type.
-    val component = requireExactlyOne(
-        "NewX timeline component that creates the seen-posts tracker",
-        urtClasses.filter { classDef ->
-            classDef.type != trackerType && classDef.methods.any { method ->
-                method.name == "<init>" && method.implementation?.instructions?.any { instruction ->
-                    (instruction.opcode == Opcode.INVOKE_DIRECT || instruction.opcode == Opcode.INVOKE_DIRECT_RANGE) &&
-                        instruction.getReference<MethodReference>()?.let { call ->
-                            call.name == "<init>" && call.definingClass == trackerType
-                        } == true
-                } == true
-            }
-        },
-    ) { it.type }
-    val trackerField = requireExactlyOne(
-        "NewX timeline component's seen-posts tracker field",
-        component.fields.filter { field ->
-            field.type == trackerType && !AccessFlags.STATIC.isSet(field.accessFlags)
-        },
-    ) { "${it.definingClass}->${it.name}:${it.type}" }
-    // The bridge lives in the extension, another package: everything it touches must be public.
-    val trackerClass = context.classDefBy(trackerType)
-    if (!AccessFlags.PUBLIC.isSet(component.accessFlags) ||
-        !AccessFlags.PUBLIC.isSet(trackerClass.accessFlags) ||
-        !AccessFlags.PUBLIC.isSet(trackerField.accessFlags)
-    ) {
-        throw PatchException(
-            "NewX seen-posts tracker ${trackerField.definingClass}->${trackerField.name} is not reachable from the extension",
-        )
+    // reportContainer(component, left, top, right, bottom)
+    replaceBridge("reportContainer", listOf(OBJECT, "F", "F", "F", "F"), "V", totalRegisters = 8) { p0 ->
+        move(0, p0, OBJECT)
+        checkCast(0, componentInterface)
+        newInstance(1, rect.type)
+        invokeDirect(methodReference(rectConstructor.smaliReference()), 1, p0 + 1, p0 + 2, p0 + 3, p0 + 4)
+        newInstance(2, container.type)
+        invokeDirect(methodReference(containerConstructor.smaliReference()), 2, 1)
+        invokeInterface(methodReference(eventMethod.smaliReference()), 0, 2)
+        returnVoid()
     }
 
-    replaceBridge("markPostSeen", listOf(OBJECT, OBJECT), "V", totalRegisters = 4) { p0 ->
+    // reportCardPositioned(component, item, left, top, right, bottom, index). The event's
+    // constructor takes its three values in whatever order this target declares them.
+    replaceBridge(
+        "reportCardPositioned",
+        listOf(OBJECT, OBJECT, "F", "F", "F", "F", "I"),
+        "V",
+        totalRegisters = 11,
+    ) { p0 ->
         move(0, p0, OBJECT)
-        checkCast(0, component.type)
-        iget(0, 0, trackerField)
+        checkCast(0, componentInterface)
         move(1, p0 + 1, OBJECT)
-        checkCast(1, markSeen.parameterTypes[0].toString())
-        invokeVirtual(methodReference(markSeen.smaliReference()), 0, 1)
+        checkCast(1, itemType)
+        newInstance(2, rect.type)
+        invokeDirect(methodReference(rectConstructor.smaliReference()), 2, p0 + 2, p0 + 3, p0 + 4, p0 + 5)
+        newInstance(3, positioned.type)
+        val arguments = positionedConstructor.parameterDescriptors().map { parameter ->
+            when (parameter) {
+                "I" -> p0 + 6
+                rect.type -> 2
+                else -> 1
+            }
+        }
+        invokeDirect(methodReference(positionedConstructor.smaliReference()), 3, *arguments.toIntArray())
+        invokeInterface(methodReference(eventMethod.smaliReference()), 0, 3)
+        returnVoid()
+    }
+
+    // reportCardDisposed(component, item)
+    replaceBridge("reportCardDisposed", listOf(OBJECT, OBJECT), "V", totalRegisters = 5) { p0 ->
+        move(0, p0, OBJECT)
+        checkCast(0, componentInterface)
+        move(1, p0 + 1, OBJECT)
+        checkCast(1, itemType)
+        newInstance(2, disposed.type)
+        invokeDirect(methodReference(disposedConstructor.smaliReference()), 2, 1)
+        invokeInterface(methodReference(eventMethod.smaliReference()), 0, 2)
         returnVoid()
     }
 }
@@ -589,8 +678,8 @@ private fun requireScrollContainersLink() {
  * target's own NestedScrollView ([requireScrollContainersLink]), and wires one-tap
  * like/unlike/repost/bookmark to X's own post-actions service. That wiring is optional: when it
  * cannot be resolved the cards keep using X's in-app action links, so the layout still ships.
- * So are Home re-select ([patchHomeReselect]) and telling X which posts the cards showed
- * ([patchSeenPosts]).
+ * So is Home re-select ([patchHomeReselect]). Reporting the cards to X the way its own rows
+ * report themselves ([patchRowReports]) is required.
  */
 @Suppress("unused")
 val newXMagazineFeedPatch =
@@ -640,11 +729,8 @@ val newXMagazineFeedPatch =
                 .onFailure { failure ->
                     System.err.println("NewX Piko 2.0: Home re-select not forwarded to the cards: ${failure.message}")
                 }
-            // Also optional: without it X is not told which posts the cards showed, and keeps
-            // sending them again (the state of every build before this step existed).
-            runCatching { patchSeenPosts() }
-                .onFailure { failure ->
-                    System.err.println("NewX Piko 2.0: seen posts are not reported to X: ${failure.message}")
-                }
+            // Required: without it X never learns which posts the cards showed, counts no view
+            // for them and keeps sending them again. A feed that does that is not shipped.
+            patchRowReports()
         }
     }
