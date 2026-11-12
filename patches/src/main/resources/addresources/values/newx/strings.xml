@@ -158,7 +158,9 @@
     <string name="piko_newx_disable_blur_title">Disable Compose blur</string>
     <string name="piko_newx_disable_blur_summary">Removes blur from NewX Compose UI while keeping configured background tint and scrim effects</string>
     <string name="piko_newx_piko_2_magazine_title">Piko 2.0</string>
-    <string name="piko_newx_piko_2_magazine_summary">Shows the home timeline as a magazine-style grid of post cards. Tap a card to open the post.</string>
+    <string name="piko_newx_piko_2_magazine_summary">Shows the home timeline as a magazine-style grid of post cards</string>
+    <string name="piko_newx_piko_2_open_post_on_tap_title">Piko 2.0: open post on tap</string>
+    <string name="piko_newx_piko_2_open_post_on_tap_summary">Tapping a card opens the post and its replies instead of the enlarged card</string>
 
     <string name="piko_newx_browse_tweet_object_title">Browse tweet object</string>
     <string name="piko_newx_browse_tweet_object_summary">Adds a debug option to inspect the tweet object in post menus</string>

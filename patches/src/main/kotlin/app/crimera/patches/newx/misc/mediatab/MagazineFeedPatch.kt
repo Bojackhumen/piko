@@ -709,6 +709,16 @@ val newXMagazineFeedPatch =
             rebootApp = true,
         )
 
+        // What a tap on a card does: off, the enlarged card; on, the post itself with its
+        // replies. The extension reads it at each tap, so no restart is needed.
+        newXToggle(
+            id = "newx.appearance.piko_2_open_post_on_tap",
+            category = Categories.APPEARANCE,
+            strings = settingStrings("piko_newx_piko_2_open_post_on_tap"),
+            order = 91,
+            defaultValue = false,
+        )
+
         execute {
             if (magazineHomeTimelineFields.isEmpty()) {
                 throw PatchException(

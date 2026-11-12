@@ -87,12 +87,19 @@ public final class MagazineFeed {
     private static final String LOG_PREFIX = "[PikoNewX][Magazine] ";
     // Piko's "Show sensitive media". Off: X's warnings are kept, so cards keep them too.
     private static final String SHOW_SENSITIVE_SETTING = "newx.content.show_sensitive_media";
+    // On: a tap on a card opens the post itself (with its replies), not the enlarged card.
+    private static final String OPEN_POST_ON_TAP_SETTING = "newx.appearance.piko_2_open_post_on_tap";
 
     private MagazineFeed() {
     }
 
     public static boolean isEnabled() {
         return SettingsRegistry.getBooleanOrDefault(SETTING_ID, false);
+    }
+
+    // Read at each tap, so the setting takes effect without rebuilding the cards.
+    private static boolean opensPostOnTap() {
+        return SettingsRegistry.getBooleanOrDefault(OPEN_POST_ON_TAP_SETTING, false);
     }
 
     public static Function1<Object, Object> createFactory(
@@ -657,6 +664,16 @@ public final class MagazineFeed {
                 return String.format(english, value);
             }
         }
+    }
+
+    /**
+     * What a toast says when an action has to be finished on the post, which is opening. X has
+     * no such sentence, so outside English it is X's own name for the action and for viewing a
+     * post ("Like · View post").
+     */
+    private static String fromThePost(Context context, String english, String actionLabel) {
+        if (Labels.english(context)) return english;
+        return actionLabel + " \u00B7 " + Labels.of(context, "View post", "view_tweet_text");
     }
 
     // ---------- Links in a card's text ----------
@@ -2222,8 +2239,12 @@ public final class MagazineFeed {
             root.setElevation(Theme.dpToPx(context, 1f));
             clipToRoundRect(root, Theme.dpToPx(context, CARD_RADIUS_DP));
             root.setClickable(true);
-            // A timeline card pops out into the focus view; the enlarged card itself stays put.
-            View.OnClickListener popOut = focal ? null : view -> showFocus(context, card);
+            // A timeline card pops out into the focus view, or opens its post when the reader
+            // chose that; the enlarged card itself stays put.
+            View.OnClickListener popOut = focal ? null : view -> {
+                if (opensPostOnTap()) openInX(context, card.postLink());
+                else showFocus(context, card);
+            };
             root.setOnClickListener(view -> {
                 if (popOut != null) popOut.onClick(view);
             });
@@ -2274,9 +2295,13 @@ public final class MagazineFeed {
                 TextView text = text(context, bodyText, focal ? 19f : 16f, card.coverText != null ? muted : ink);
                 text.setLineSpacing(0f, focal ? 1.25f : 1.2f);
                 if (card.coverText == null) showLinks(text, card);
+                // Text that is cut says so: "Show more" under it opens the whole post.
+                TextView more = card.coverText != null ? null : showMore(context, card);
+                View shownText = text;
                 if (!focal) {
                     text.setMaxLines(card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA);
                     text.setEllipsize(TextUtils.TruncateAt.END);
+                    if (more != null) shownText = new ClampedText(context, text, more);
                 } else {
                     // Keep the enlarged card within the screen: budget the text by the viewport,
                     // leaving room for the media (capped to the same share, see focalMediaHeight)
@@ -2302,13 +2327,19 @@ public final class MagazineFeed {
                                 text.setEllipsize(TextUtils.TruncateAt.END);
                                 text.setMaxLines(maxLines);
                                 text.setOnClickListener(view -> openInX(context, card.postLink()));
+                                // The enlarged card is alone on its screen: it may grow by a line.
+                                if (more != null) more.setVisibility(View.VISIBLE);
                             });
                         }
                     });
                 }
                 LinearLayout.LayoutParams params = matchWidth();
                 params.topMargin = Theme.dpToPx(context, 8f);
-                body.addView(text, params);
+                body.addView(shownText, params);
+                if (focal && more != null) {
+                    more.setVisibility(View.GONE);
+                    body.addView(more, matchWidth());
+                }
             }
 
             if (card.quote != null && card.coverText == null) {
@@ -2324,6 +2355,69 @@ public final class MagazineFeed {
             // MasonryGrid.updateWindow); the enlarged card is on screen now.
             if (focal) root.showPictures(true);
             return root;
+        }
+
+        // "Show more" under text that is cut (see ClampedText): its size, and the gap above it.
+        private static final float SHOW_MORE_SP = 14f;
+        private static final float SHOW_MORE_GAP_DP = 6f;
+
+        /** The "Show more" line of a card whose text is cut. It opens the whole post. */
+        private static TextView showMore(Context context, PostCard card) {
+            TextView more = text(context, Labels.of(context, "Show more", "note_tweet_show_more_button"),
+                    SHOW_MORE_SP, Theme.primaryAccent(context));
+            bold(more);
+            more.setPadding(0, Theme.dpToPx(context, SHOW_MORE_GAP_DP), 0, 0);
+            more.setOnClickListener(view -> openInX(context, card.postLink()));
+            return more;
+        }
+
+        /**
+         * A grid card's text with "Show more" under it when the text is cut. Whether it is cut
+         * is only known once the text is measured at the card's width, and a grid card's
+         * height must be settled by its measure (see MasonryGrid.onMeasure): the line is
+         * counted in or left out there, never shown or hidden afterwards.
+         */
+        private static final class ClampedText extends ViewGroup {
+            private final TextView text;
+            private final TextView more;
+            private boolean cut;
+
+            ClampedText(Context context, TextView text, TextView more) {
+                super(context);
+                this.text = text;
+                this.more = more;
+                addView(text);
+                addView(more);
+            }
+
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                int free = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
+                text.measure(widthMeasureSpec, free);
+                android.text.Layout layout = text.getLayout();
+                int lines = layout == null ? 0 : layout.getLineCount();
+                int most = text.getMaxLines();
+                // Cut text ends in an ellipsis on its last line, or has more lines than it shows.
+                cut = lines > 0 && most > 0
+                        && (lines > most || layout.getEllipsisCount(Math.min(lines, most) - 1) > 0);
+                int height = text.getMeasuredHeight();
+                more.measure(widthMeasureSpec, free);
+                if (cut) height += more.getMeasuredHeight();
+                int width = MeasureSpec.getMode(widthMeasureSpec) == MeasureSpec.UNSPECIFIED
+                        ? text.getMeasuredWidth()
+                        : MeasureSpec.getSize(widthMeasureSpec);
+                setMeasuredDimension(width, height);
+            }
+
+            @Override
+            protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+                int width = right - left;
+                int textBottom = text.getMeasuredHeight();
+                text.layout(0, 0, width, textBottom);
+                // Not cut: the line has no room, so it is neither drawn nor touched.
+                if (cut) more.layout(0, textBottom, width, textBottom + more.getMeasuredHeight());
+                else more.layout(0, 0, 0, 0);
+            }
         }
 
         /**
@@ -2364,7 +2458,12 @@ public final class MagazineFeed {
             String shown = card.coverText != null ? card.coverText : card.text;
             if (shown != null) {
                 int most = card.media.isEmpty() ? MAX_TEXT_LINES : MAX_TEXT_LINES_WITH_MEDIA;
-                height += Math.min(most, lines(shown, inner, 16f * sp)) * 16f * sp * 1.17f * 1.2f;
+                int needed = lines(shown, inner, 16f * sp);
+                height += Math.min(most, needed) * 16f * sp * 1.17f * 1.2f;
+                // Cut text has "Show more" under it (see ClampedText).
+                if (needed > most && card.coverText == null) {
+                    height += SHOW_MORE_SP * sp * 1.17f + SHOW_MORE_GAP_DP * dp;
+                }
             }
             if (card.quote != null && card.coverText == null && card.quote.text != null) {
                 float quoteInner = Math.max(1f, inner - 24f * dp);
@@ -2464,7 +2563,7 @@ public final class MagazineFeed {
             menu.getMenu().add(0, 1, 0, Labels.of(context, "Open post", "view_tweet_text"));
             menu.getMenu().add(0, 2, 1, Labels.of(context, "Copy link", "copy_link"));
             // Not for a post X covers with a warning: the card does not show that text either.
-            if (card.text != null && card.coverText == null) menu.getMenu().add(0, 5, 2, "Copy text");
+            if (card.text != null && card.coverText == null) menu.getMenu().add(0, 5, 2, Labels.of(context, "Copy text", "grok_action_copy"));
             menu.getMenu().add(0, 3, 3, Labels.of(context, "Share via\u2026", "room_settings_system_share_via"));
             if (card.handle != null) {
                 menu.getMenu().add(0, 4, 4, (Labels.english(context) ? "View @" : "@") + card.handle);
@@ -2580,7 +2679,9 @@ public final class MagazineFeed {
                     refreshGridCard(card.postId, view);
                 } else {
                     // Say why the screen changes: the tap was a like, not "open the post".
-                    Toast.makeText(context, liking ? "Like it from the post" : "Unlike it from the post",
+                    Toast.makeText(context, liking
+                            ? fromThePost(context, "Like it from the post", likeLabel)
+                            : fromThePost(context, "Unlike it from the post", unlikeLabel),
                             Toast.LENGTH_SHORT).show();
                     openInX(context, card.postLink());
                 }
@@ -2607,7 +2708,8 @@ public final class MagazineFeed {
                             Toast.LENGTH_SHORT).show();
                 } else {
                     // X has no bookmark link; its own bookmark button is on the post screen.
-                    Toast.makeText(context, "Bookmark it from the post", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(context, fromThePost(context, "Bookmark it from the post", bookmarkLabel),
+                            Toast.LENGTH_SHORT).show();
                     openInX(context, card.postLink());
                 }
             });
@@ -2773,7 +2875,8 @@ public final class MagazineFeed {
             letter.setGravity(Gravity.CENTER);
             frame.addView(letter, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-            frame.setContentDescription(card.name == null ? "Profile" : card.name + " profile");
+            String profileLabel = Labels.of(context, "Profile", "drawer_profile_title");
+            frame.setContentDescription(card.name == null ? profileLabel : card.name + ", " + profileLabel);
             if (card.avatarUrl != null) {
                 ImageView image = new ImageView(context);
                 image.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -2813,7 +2916,8 @@ public final class MagazineFeed {
             box.setClickable(true);
             box.setForeground(pressRipple(context));
             box.setOnClickListener(popOut != null ? popOut : view -> openInX(context, quote.link()));
-            box.setContentDescription("Quoted post" + (quote.name == null ? "" : " by " + quote.name));
+            String quoteLabel = Labels.of(context, "Quoted post", "quote_post_a11y_label");
+            box.setContentDescription(quote.name == null ? quoteLabel : quoteLabel + ", " + quote.name);
 
             if (!quote.media.isEmpty()) {
                 box.addView(mediaBlock(context, quote.media.subList(0, 1), quote, popOut), matchWidth());
@@ -2823,7 +2927,7 @@ public final class MagazineFeed {
             int pad = Theme.dpToPx(context, 10f);
             inner.setPadding(pad + Theme.dpToPx(context, 2f), pad, pad + Theme.dpToPx(context, 2f), pad);
             String who = joinNonNull(quote.name, quote.handle == null ? null : "@" + quote.handle);
-            TextView author = text(context, who == null ? "Quoted post" : who, 13.5f, quote.name == null ? muted : ink);
+            TextView author = text(context, who == null ? quoteLabel : who, 13.5f, quote.name == null ? muted : ink);
             bold(author);
             author.setSingleLine(true);
             author.setEllipsize(TextUtils.TruncateAt.END);
@@ -2984,7 +3088,9 @@ public final class MagazineFeed {
             tile.setClickable(true);
             tile.setForeground(CardViews.pressRipple(context));
             tile.setOnClickListener(click);
-            tile.setContentDescription(item.video ? "Video" : "Photo " + (index + 1));
+            tile.setContentDescription(item.video
+                    ? Labels.of(context, "Video", "file_video_name")
+                    : Labels.of(context, "Photo", "file_photo_name") + " " + (index + 1));
             ImageView image = new ImageView(context);
             image.setScaleType(scaleFor(aspect));
             tile.addView(image, new FrameLayout.LayoutParams(
@@ -3270,7 +3376,9 @@ public final class MagazineFeed {
             this.item = item;
             this.sizeListener = sizeListener;
             setBackgroundColor(Color.BLACK);
-            setContentDescription(item.gif ? "GIF" : "Video, tap to pause, double-tap the sides to seek");
+            setContentDescription(item.gif
+                    ? Labels.of(context, "GIF", "button_action_found_media")
+                    : Labels.of(context, "Video, tap to pause, double-tap the sides to seek", "file_video_name"));
 
             texture = new android.view.TextureView(context);
             texture.setSurfaceTextureListener(this);
@@ -3311,7 +3419,7 @@ public final class MagazineFeed {
                 int accent = Theme.primaryAccent(context);
                 scrubber.setProgressTintList(ColorStateList.valueOf(accent));
                 scrubber.setThumbTintList(ColorStateList.valueOf(accent));
-                scrubber.setContentDescription("Video position");
+                scrubber.setContentDescription(Labels.of(context, "Video position", "offline_replays_scrubber"));
                 scrubber.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
                     @Override
                     public void onProgressChanged(android.widget.SeekBar sb, int progress, boolean fromUser) {
@@ -3349,7 +3457,7 @@ public final class MagazineFeed {
 
                 int soundSize = Theme.dpToPx(context, 32f);
                 sound = overlayButton(context, "\uD83D\uDD07", 32f);
-                sound.setContentDescription("Turn sound on");
+                sound.setContentDescription(Labels.of(context, "Turn sound on", "unmute"));
                 sound.setOnClickListener(view -> toggleSound());
                 LinearLayout.LayoutParams soundParams = new LinearLayout.LayoutParams(soundSize, soundSize);
                 soundParams.setMarginStart(gap);
@@ -3386,7 +3494,7 @@ public final class MagazineFeed {
 
             int small = Theme.dpToPx(context, 36f);
             TextView expand = overlayButton(context, "\u2922", 36f);
-            expand.setContentDescription("Open in X's player");
+            expand.setContentDescription(Labels.of(context, "Open in X's player", "broadcast_fullscreen_a11y"));
             expand.setOnClickListener(openInPlayer);
             FrameLayout.LayoutParams expandParams = new FrameLayout.LayoutParams(small, small, Gravity.TOP | Gravity.END);
             expandParams.setMargins(inset, inset, inset, inset);
@@ -3668,7 +3776,9 @@ public final class MagazineFeed {
             muted = !muted;
             if (sound != null) {
                 sound.setText(muted ? "\uD83D\uDD07" : "\uD83D\uDD0A");
-                sound.setContentDescription(muted ? "Turn sound on" : "Mute");
+                sound.setContentDescription(muted
+                        ? Labels.of(getContext(), "Turn sound on", "unmute")
+                        : Labels.of(getContext(), "Mute", "mute"));
             }
             if (player != null) {
                 try {
@@ -4181,11 +4291,12 @@ public final class MagazineFeed {
             return link == null ? null : "https://x.com/intent/post?url=" + Uri.encode(link);
         }
 
+        // What a screen reader says for the card: who, then what. No words of its own, so it
+        // reads the same in every language.
         String describe() {
-            StringBuilder out = new StringBuilder("Post");
-            if (name != null) out.append(" by ").append(name);
-            if (text != null) out.append(": ").append(text.length() > 140 ? text.substring(0, 140) : text);
-            return out.toString();
+            String start = text == null ? null : text.length() > 140 ? text.substring(0, 140) : text;
+            if (name == null) return start;
+            return start == null ? name : name + ": " + start;
         }
 
         // Cards are equal when they show the same post; the item object changes every emission.
