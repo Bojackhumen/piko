@@ -2167,6 +2167,14 @@ public final class MagazineFeed {
         private CardViews() {
         }
 
+        /** What a tap on a grid card does: the enlarged card, or the post when the reader chose that. */
+        private static View.OnClickListener cardTap(Context context, PostCard card) {
+            return view -> {
+                if (opensPostOnTap()) openInX(context, card.postLink());
+                else showFocus(context, card);
+            };
+        }
+
         // Mark the parts of a built card that are found again later: the action row and the
         // "@handle · age · views" line (refreshed in place, see rebind), and the More button
         // (the menu a long press on the card opens from).
@@ -2193,8 +2201,8 @@ public final class MagazineFeed {
             String byline = byline(context, card);
             if (line instanceof TextView text && byline != null) text.setText(byline);
             cardRoot.setContentDescription(card.describe());
-            // Keep the card tap (focus view) pointed at the fresh card.
-            cardRoot.setOnClickListener(view -> showFocus(context, card));
+            // Keep the card tap pointed at the fresh card.
+            cardRoot.setOnClickListener(cardTap(context, card));
         }
 
         /** The theme's touch ripple, to lay over a tappable view; null when the theme has none. */
@@ -2241,10 +2249,7 @@ public final class MagazineFeed {
             root.setClickable(true);
             // A timeline card pops out into the focus view, or opens its post when the reader
             // chose that; the enlarged card itself stays put.
-            View.OnClickListener popOut = focal ? null : view -> {
-                if (opensPostOnTap()) openInX(context, card.postLink());
-                else showFocus(context, card);
-            };
+            View.OnClickListener popOut = focal ? null : cardTap(context, card);
             root.setOnClickListener(view -> {
                 if (popOut != null) popOut.onClick(view);
             });
@@ -3340,11 +3345,30 @@ public final class MagazineFeed {
     private static final class VideoTile extends FrameLayout implements android.view.TextureView.SurfaceTextureListener {
         private static final int SEEK_STEP_MS = 10_000;
 
+        // A GIF is played from a copy in the app's cache, not straight from its address: the
+        // loop then needs the network once, and a clip the system player cannot fetch itself
+        // still plays. Copies are small and few are kept.
+        private static final java.util.concurrent.ExecutorService CLIPS =
+                java.util.concurrent.Executors.newCachedThreadPool();
+        private static final android.os.Handler MAIN = new android.os.Handler(android.os.Looper.getMainLooper());
+        private static final String CLIP_FOLDER = "piko_magazine_clips";
+        private static final long MAX_CLIP_BYTES = 16L * 1024 * 1024;
+        private static final int MAX_CLIPS_KEPT = 16;
+
         private final MediaItem item;
         private final VideoSizeListener sizeListener;
+        private final View.OnClickListener openInPlayer;
         private final android.view.TextureView texture;
         private final ImageView poster;
         private final TextView playBadge;
+        // Says that the clip could not be played here, and why (a short code to report).
+        private final TextView problem;
+        // Could not be played here: a tap opens X's own player instead.
+        private boolean failed;
+        // The copy of a GIF could not be made or played: the player reads the address itself.
+        private boolean streamOnly;
+        // Counts starts and releases, so a copy that arrives late is not played.
+        private int startToken;
         private final TextView seekFeedback;
         private final android.view.GestureDetector gestures;
         private TextView sound;
@@ -3375,6 +3399,7 @@ public final class MagazineFeed {
             super(context);
             this.item = item;
             this.sizeListener = sizeListener;
+            this.openInPlayer = openInPlayer;
             setBackgroundColor(Color.BLACK);
             setContentDescription(item.gif
                     ? Labels.of(context, "GIF", "button_action_found_media")
@@ -3492,6 +3517,16 @@ public final class MagazineFeed {
             addView(playBadge, new FrameLayout.LayoutParams(
                     Theme.dpToPx(context, 48f), Theme.dpToPx(context, 48f), Gravity.CENTER));
 
+            problem = timeLabel(context, "");
+            problem.setPadding(inset, inset / 2, inset, inset / 2);
+            problem.setBackground(CardViews.rounded(0xB3000000, Theme.dpToPx(context, 12f)));
+            problem.setVisibility(View.GONE);
+            FrameLayout.LayoutParams problemParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+            problemParams.setMargins(inset, inset, inset, inset);
+            addView(problem, problemParams);
+
             int small = Theme.dpToPx(context, 36f);
             TextView expand = overlayButton(context, "\u2922", 36f);
             expand.setContentDescription(Labels.of(context, "Open in X's player", "broadcast_fullscreen_a11y"));
@@ -3508,7 +3543,9 @@ public final class MagazineFeed {
 
                 @Override
                 public boolean onSingleTapConfirmed(MotionEvent event) {
-                    togglePlay();
+                    // What cannot be played here still plays in X's own player.
+                    if (failed) openInPlayer.onClick(VideoTile.this);
+                    else togglePlay();
                     return true;
                 }
 
@@ -3586,6 +3623,32 @@ public final class MagazineFeed {
         private void start() {
             release();
             prepared = false;
+            failed = false;
+            problem.setVisibility(View.GONE);
+            String url = item.videoUrl;
+            if (!item.gif || streamOnly) {
+                play(url);
+                return;
+            }
+            int token = startToken;
+            java.io.File folder = new java.io.File(getContext().getCacheDir(), CLIP_FOLDER);
+            CLIPS.execute(() -> {
+                java.io.File copy = clipCopy(folder, url);
+                MAIN.post(() -> {
+                    // Closed, or started again, while the copy was made.
+                    if (token != startToken || surface == null) return;
+                    if (copy == null) {
+                        streamOnly = true;
+                        play(url);
+                    } else {
+                        play(copy.getAbsolutePath());
+                    }
+                });
+            });
+        }
+
+        /** Plays {@code source}: the clip's address, or the path of its copy in the cache. */
+        private void play(String source) {
             try {
                 android.media.MediaPlayer mediaPlayer = new android.media.MediaPlayer();
                 player = mediaPlayer;
@@ -3593,7 +3656,7 @@ public final class MagazineFeed {
                         .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
                         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
                         .build());
-                mediaPlayer.setDataSource(item.videoUrl);
+                mediaPlayer.setDataSource(source);
                 mediaPlayer.setSurface(surface);
                 mediaPlayer.setLooping(item.gif);
                 // Muted at first; a player started again keeps the reader's sound choice.
@@ -3628,18 +3691,108 @@ public final class MagazineFeed {
                     sizeListener.onSize(width, height);
                     fitVideo();
                 });
-                mediaPlayer.setOnCompletionListener(mp -> setPlaying(false));
+                mediaPlayer.setOnCompletionListener(mp -> {
+                    if (player == mp) setPlaying(false);
+                });
                 mediaPlayer.setOnErrorListener((mp, what, extra) -> {
-                    log("inline video failed what=" + what + " extra=" + extra);
-                    poster.setVisibility(View.VISIBLE);
-                    setPlaying(false);
+                    log("inline video failed what=" + what + " extra=" + extra
+                            + " gif=" + item.gif + " copy=" + (item.gif && !streamOnly));
+                    if (player != mp) return true;
+                    if (item.gif && !streamOnly) {
+                        // The copy did not play: once more straight from the address, as before.
+                        streamOnly = true;
+                        int token = startToken;
+                        MAIN.post(() -> {
+                            if (token == startToken && surface != null) start();
+                        });
+                        return true;
+                    }
+                    showFailed(what + "/" + extra);
                     return true;
                 });
                 mediaPlayer.prepareAsync();
             } catch (java.io.IOException | RuntimeException e) {
                 NewXLogger.printException(() -> LOG_PREFIX + "inline video could not start", e);
-                playBadge.setVisibility(View.VISIBLE);
+                showFailed(e.getClass().getSimpleName());
             }
+        }
+
+        /** The clip stays a still picture: say so, with the reason, and let a tap open X's player. */
+        private void showFailed(String reason) {
+            failed = true;
+            poster.setVisibility(View.VISIBLE);
+            setPlaying(false);
+            problem.setText(Labels.of(getContext(), "Can't play here", "error_dialog_title") + " (" + reason + ")");
+            problem.setVisibility(View.VISIBLE);
+        }
+
+        /**
+         * The copy of a GIF's clip in the cache, fetched first when it is not there yet; null
+         * when it cannot be made (the player then reads the address itself). Not on the main
+         * thread.
+         */
+        private static java.io.File clipCopy(java.io.File folder, String url) {
+            java.io.File part = null;
+            java.net.HttpURLConnection connection = null;
+            try {
+                if (!folder.isDirectory() && !folder.mkdirs()) return null;
+                // The clip's own file name tells clips apart; the hash covers the rest of the address.
+                String name = url.substring(url.lastIndexOf('/') + 1).replaceAll("[^A-Za-z0-9_-]", "_");
+                if (name.length() > 48) name = name.substring(0, 48);
+                java.io.File copy = new java.io.File(folder, name + "_" + Integer.toHexString(url.hashCode()) + ".mp4");
+                if (copy.isFile() && copy.length() > 0) {
+                    // Kept longest: the copies played last.
+                    copy.setLastModified(System.currentTimeMillis());
+                    return copy;
+                }
+                part = new java.io.File(folder, copy.getName() + "." + System.nanoTime() + ".part");
+                connection = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                connection.setConnectTimeout(15_000);
+                connection.setReadTimeout(20_000);
+                if (connection.getResponseCode() != 200) {
+                    log("GIF copy not fetched: status " + connection.getResponseCode());
+                    return null;
+                }
+                long total = 0;
+                try (java.io.InputStream in = connection.getInputStream();
+                     java.io.OutputStream out = new java.io.FileOutputStream(part)) {
+                    byte[] buffer = new byte[64 * 1024];
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        total += read;
+                        if (total > MAX_CLIP_BYTES) return null;
+                        out.write(buffer, 0, read);
+                    }
+                }
+                if (total == 0 || !part.renameTo(copy)) return null;
+                part = null;
+                trimClips(folder, copy);
+                return copy;
+            } catch (java.io.IOException | RuntimeException e) {
+                NewXLogger.printException(() -> LOG_PREFIX + "GIF copy could not be made", e);
+                return null;
+            } finally {
+                if (connection != null) connection.disconnect();
+                if (part != null) part.delete();
+            }
+        }
+
+        /** Keeps the newest copies only, and clears out fetches that were cut off. */
+        private static void trimClips(java.io.File folder, java.io.File keep) {
+            java.io.File[] files = folder.listFiles();
+            if (files == null) return;
+            long now = System.currentTimeMillis();
+            List<java.io.File> copies = new ArrayList<>();
+            for (java.io.File file : files) {
+                if (file.getName().endsWith(".part")) {
+                    if (now - file.lastModified() > 10 * 60_000L) file.delete();
+                } else if (!file.equals(keep)) {
+                    copies.add(file);
+                }
+            }
+            if (copies.size() < MAX_CLIPS_KEPT) return;
+            Collections.sort(copies, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+            for (int i = 0; i <= copies.size() - MAX_CLIPS_KEPT; i++) copies.get(i).delete();
         }
 
         private void togglePlay() {
@@ -3803,6 +3956,7 @@ public final class MagazineFeed {
         }
 
         private void release() {
+            startToken++;
             removeCallbacks(progressTick);
             prepared = false;
             pausedByWindow = false;
